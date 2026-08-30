@@ -5,6 +5,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { TeamleaderClient } from "../api/client.js";
+import { respond, respondError } from "../lib/respond.js";
 import type {
   Contact,
   TeamleaderListResponse,
@@ -180,6 +181,135 @@ export function registerContactTools(
           },
         ],
       };
+    }
+  );
+
+  // ── Link Contact to Company ──────────────────────────────────────────────
+  server.tool(
+    "teamleader_link_contact_to_company",
+    "Link a contact to a company in Teamleader Focus",
+    {
+      id: z.string().describe("The contact ID to link"),
+      company_id: z.string().describe("The company ID to link the contact to"),
+      position: z
+        .string()
+        .optional()
+        .describe("The contact's job title at the company (e.g. 'CEO')"),
+      decision_maker: z
+        .boolean()
+        .optional()
+        .describe("Whether this contact is a decision maker at the company"),
+    },
+    async (params) => {
+      try {
+        const body: Record<string, unknown> = {
+          id: params.id,
+          company_id: params.company_id,
+        };
+
+        if (params.position !== undefined) body.position = params.position;
+        if (params.decision_maker !== undefined) {
+          body.decision_maker = params.decision_maker;
+        }
+
+        await client.request({
+          endpoint: "contacts.linkToCompany",
+          body,
+        });
+
+        return respond({
+          success: true,
+          id: params.id,
+          company_id: params.company_id,
+          action: "linked",
+        });
+      } catch (error) {
+        return respondError(
+          `Failed to link contact ${params.id} to company ${params.company_id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+  );
+
+  // ── Unlink Contact from Company ──────────────────────────────────────────
+  server.tool(
+    "teamleader_unlink_contact_from_company",
+    "Unlink a contact from a company in Teamleader Focus",
+    {
+      id: z.string().describe("The contact ID to unlink"),
+      company_id: z.string().describe("The company ID to unlink the contact from"),
+    },
+    async (params) => {
+      try {
+        await client.request({
+          endpoint: "contacts.unlinkFromCompany",
+          body: { id: params.id, company_id: params.company_id },
+        });
+
+        return respond({
+          success: true,
+          id: params.id,
+          company_id: params.company_id,
+          action: "unlinked",
+        });
+      } catch (error) {
+        return respondError(
+          `Failed to unlink contact ${params.id} from company ${params.company_id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+  );
+
+  // ── Update Contact-Company Link ──────────────────────────────────────────
+  server.tool(
+    "teamleader_update_contact_company_link",
+    "Update the position or decision maker flag on an existing contact-company link in Teamleader Focus",
+    {
+      id: z.string().describe("The contact ID whose company link should be updated"),
+      company_id: z.string().describe("The company ID the contact is linked to"),
+      position: z
+        .string()
+        .optional()
+        .describe("The contact's job title at the company (e.g. 'CEO'); pass an empty string to clear it"),
+      decision_maker: z
+        .boolean()
+        .optional()
+        .describe("Whether this contact is a decision maker at the company"),
+    },
+    async (params) => {
+      try {
+        const body: Record<string, unknown> = {
+          id: params.id,
+          company_id: params.company_id,
+        };
+
+        if (params.position !== undefined) body.position = params.position;
+        if (params.decision_maker !== undefined) {
+          body.decision_maker = params.decision_maker;
+        }
+
+        await client.request({
+          endpoint: "contacts.updateCompanyLink",
+          body,
+        });
+
+        return respond({
+          success: true,
+          id: params.id,
+          company_id: params.company_id,
+          action: "company_link_updated",
+        });
+      } catch (error) {
+        return respondError(
+          `Failed to update the company link for contact ${params.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
     }
   );
 }

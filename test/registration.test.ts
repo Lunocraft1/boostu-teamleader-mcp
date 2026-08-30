@@ -33,6 +33,9 @@ describe("createServer", () => {
     expect(registered).toContain("teamleader_calls_list");
     expect(registered).toContain("teamleader_tickets_list");
     expect(registered).toContain("teamleader_contacts_add_tags");
+    expect(registered).toContain("teamleader_link_contact_to_company");
+    expect(registered).toContain("teamleader_unlink_contact_from_company");
+    expect(registered).toContain("teamleader_update_contact_company_link");
     expect(registered).toContain("teamleader_notes_list");
     expect(registered).toContain("teamleader_files_list");
     expect(registered).toContain("teamleader_webhooks_list");
