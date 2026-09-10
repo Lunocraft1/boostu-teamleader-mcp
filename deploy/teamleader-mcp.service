@@ -12,18 +12,18 @@ Description=Teamleader Focus MCP server (Streamable HTTP + OAuth)
 Documentation=https://github.com/boostuagency/boostu-teamleader-mcp
 After=network-online.target
 Wants=network-online.target
+# Keep restarting even after repeated early failures; a wedged connector is
+# worse than a noisy log. Must live in [Unit], not [Service].
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/teamleader-mcp
+WorkingDirectory=/opt/teamleader-mcp/repo
 ExecStart=/usr/bin/node dist/http.js
 EnvironmentFile=/etc/teamleader-mcp.env
 
 Restart=always
 RestartSec=3
-# Keep restarting even after repeated early failures; a wedged connector is
-# worse than a noisy log.
-StartLimitIntervalSec=0
 
 User=teamleader-mcp
 Group=teamleader-mcp

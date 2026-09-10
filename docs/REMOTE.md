@@ -115,8 +115,8 @@ dig +short mcp.von-falken.de A     # must return the public IPv4
 ```bash
 ssh root@<server>
 adduser --system --group --home /opt/teamleader-mcp --shell /usr/sbin/nologin teamleader-mcp
-git clone https://github.com/<you>/boostu-teamleader-mcp /opt/teamleader-mcp
-cd /opt/teamleader-mcp
+git clone https://github.com/<you>/boostu-teamleader-mcp /opt/teamleader-mcp/repo
+cd /opt/teamleader-mcp/repo
 git checkout feat/remote-http-oauth
 npm ci && npm run build && npm prune --omit=dev
 ```
