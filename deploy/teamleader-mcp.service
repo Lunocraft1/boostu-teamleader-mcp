@@ -1,0 +1,61 @@
+# Remote Teamleader MCP server.
+#
+# Install to /etc/systemd/system/teamleader-mcp.service
+#
+# Exactly one instance may ever run with a given set of Teamleader credentials:
+# Teamleader rotates the refresh token on every API call and accepts each token
+# once. systemd (Type=simple, no forking) gives that guarantee, and the process
+# additionally takes an advisory lock next to TEAMLEADER_TOKEN_STORE.
+
+[Unit]
+Description=Teamleader Focus MCP server (Streamable HTTP + OAuth)
+Documentation=https://github.com/boostuagency/boostu-teamleader-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/teamleader-mcp
+ExecStart=/usr/bin/node dist/http.js
+EnvironmentFile=/etc/teamleader-mcp.env
+
+Restart=always
+RestartSec=3
+# Keep restarting even after repeated early failures; a wedged connector is
+# worse than a noisy log.
+StartLimitIntervalSec=0
+
+User=teamleader-mcp
+Group=teamleader-mcp
+
+# /var/lib/teamleader-mcp, created and chowned by systemd. Holds the rotating
+# Teamleader refresh token and the OAuth database — both MUST survive a
+# restart and a redeploy, so they live here and not in the deploy directory.
+StateDirectory=teamleader-mcp
+StateDirectoryMode=0700
+
+# Hardening: the process needs the network, its state directory and nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=teamleader-mcp
+
+[Install]
+WantedBy=multi-user.target

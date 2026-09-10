@@ -8,3 +8,9 @@ dist/
 # mcp-publisher login writes these auth tokens; never commit them
 .mcpregistry_github_token
 .mcpregistry_registry_token
+
+# Remote entry point: local OAuth database and state
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

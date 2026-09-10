@@ -20,7 +20,10 @@
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "dev:http": "tsx src/http.ts",
+    "start:http": "node dist/http.js",
+    "hash-password": "tsx src/http/hashPassword.ts"
   },
   "keywords": [
     "mcp",
@@ -52,9 +55,16 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
