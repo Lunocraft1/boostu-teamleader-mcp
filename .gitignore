@@ -9,8 +9,6 @@ dist/
 .mcpregistry_github_token
 .mcpregistry_registry_token
 
-# Remote entry point: local OAuth database and state
+# Remote entry point: local OAuth store and state
 data/
-*.sqlite
-*.sqlite-wal
-*.sqlite-shm
+*.oauth-store.json

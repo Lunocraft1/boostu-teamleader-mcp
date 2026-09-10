@@ -25,7 +25,7 @@ export interface HttpConfig {
    * specific a `resource` value they send.
    */
   allowedAudiences: string[];
-  /** SQLite file holding registered clients, codes and tokens. */
+  /** JSON file holding registered clients, codes and tokens. */
   dbPath: string;
   /** scrypt hash of the consent password (see `npm run hash-password`). */
   consentPasswordHash: string;
@@ -113,7 +113,7 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
     // A token minted for the bare origin is still a token for this server;
     // anything else is not and is rejected in verifyAccessToken.
     allowedAudiences: Array.from(new Set([resource, origin])),
-    dbPath: env.OAUTH_DB_PATH?.trim() || "./data/oauth.sqlite",
+    dbPath: env.OAUTH_DB_PATH?.trim() || "./data/oauth-store.json",
     consentPasswordHash: required(env, "MCP_CONSENT_PASSWORD_HASH"),
     allowedRedirectUris: listEnv(env, "OAUTH_ALLOWED_REDIRECT_URIS", [CLAUDE_REDIRECT_URI]),
     accessTokenTtlSec: intEnv(env, "ACCESS_TOKEN_TTL", 3600),

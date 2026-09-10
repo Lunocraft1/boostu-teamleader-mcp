@@ -16,7 +16,8 @@ changes can be merged without touching any of this.
 | No SSE fallback | The GET/SSE stream and protocol-level sessions were removed in MCP revision `2026-07-28`; Claude speaks Streamable HTTP over POST. Adding SSE would mean maintaining a transport that is on its way out. |
 | Resource server and authorization server in one process | Claude fetches protected resource metadata from the MCP host and then discovers the authorization server separately. Same host means one certificate, one nginx block, and no second WAF to get wrong. |
 | Dynamic Client Registration | Claude has no pre-registered client here. CIMD would also work and avoids a client database, but DCR is what a single-user setup needs and is supported out of the box. |
-| Opaque tokens in SQLite | No signing keys to manage or rotate, and revocation is a `DELETE`. Only SHA-256 hashes are stored. |
+| Opaque tokens, stored as SHA-256 hashes | No signing keys to manage or rotate, and revocation is a delete. |
+| A JSON file, not SQLite | The dataset is a handful of clients and tokens and there is one process by design. A native module such as `better-sqlite3` must be recompiled whenever the host's Node version changes, so an unattended service would eventually stop starting for a reason unrelated to any change here. The file is rewritten atomically (write, then rename). |
 | systemd, not Docker | The target host already runs nginx on :80/:443 and three PM2 apps. Docker is not installed, and a container runtime for one Node process buys nothing here. `Type=simple` also guarantees exactly one process, which the Teamleader refresh-token rotation requires. |
 
 ## Endpoints
@@ -117,7 +118,7 @@ adduser --system --group --home /opt/teamleader-mcp --shell /usr/sbin/nologin te
 git clone https://github.com/<you>/boostu-teamleader-mcp /opt/teamleader-mcp
 cd /opt/teamleader-mcp
 git checkout feat/remote-http-oauth
-npm ci --omit=dev --ignore-scripts && npm ci && npm run build && npm prune --omit=dev
+npm ci && npm run build && npm prune --omit=dev
 ```
 
 Write `/etc/teamleader-mcp.env` from `.env.remote.example` (`chmod 600`,
@@ -220,7 +221,7 @@ arrived, and the JSON-RPC method:
 |---|---|
 | "Couldn't reach the MCP server", nothing in the log | DNS resolves to a non-public address, or a firewall blocks Anthropic's range `160.79.104.0/21`. |
 | `auth=none` on every `/mcp` request | A cross-host redirect is dropping the `Authorization` header. Register the URL nginx actually serves. |
-| Repeated `POST /register` | Claude is not keeping the client. Check that `OAUTH_DB_PATH` is on persistent storage. |
+| Repeated `POST /register` | Claude is not keeping the client. Check that `OAUTH_DB_PATH` is on persistent storage and writable. |
 | `401 invalid_client` at `/token`, then a fresh `/register` | Normal recovery after the client record was removed. |
 | Connector connects, no tools | Check for `rpc=tools/list` in the log. If it returned 200, this is the known client-side failure mode. |
 | `Failed to refresh Teamleader token: 400` | The refresh token was spent twice — almost always a second instance. Re-run `get-refresh-token.mjs` and check the lock file. |

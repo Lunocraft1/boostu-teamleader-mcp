@@ -10,6 +10,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Server } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { canonicalizeResource, loadHttpConfig, type HttpConfig } from "../src/http/config.js";
 import { hashPassword, verifyPassword } from "../src/http/password.js";
 import { OAuthStore } from "../src/http/store.js";
@@ -141,6 +144,68 @@ describe("client registration", () => {
     expect(store.getClient(client.client_id)?.redirect_uris).toEqual([CLAUDE_REDIRECT]);
     expect(store.countClients()).toBe(1);
     store.close();
+  });
+});
+
+describe("store persistence", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tl-mcp-store-"));
+  const file = join(dir, "oauth-store.json");
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("survives a restart: clients and tokens reload from the file", () => {
+    const first = new OAuthStore(file, [CLAUDE_REDIRECT]);
+    const client = first.registerClient({
+      client_name: "Claude",
+      redirect_uris: [CLAUDE_REDIRECT],
+    });
+    first.putAccessToken("tok", {
+      clientId: client.client_id,
+      scopes: ["teamleader"],
+      resource: "https://mcp.example.com/mcp",
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    });
+    first.close();
+
+    // A new process reading the same file must see both.
+    const second = new OAuthStore(file, [CLAUDE_REDIRECT]);
+    expect(second.getClient(client.client_id)?.client_name).toBe("Claude");
+    expect(second.getAccessToken("tok")?.clientId).toBe(client.client_id);
+    expect(second.countClients()).toBe(1);
+    second.close();
+  });
+
+  it("drops expired tokens but keeps non-expiring refresh tokens on reload", () => {
+    const store = new OAuthStore(file, [CLAUDE_REDIRECT]);
+    const client = store.registerClient({ redirect_uris: [CLAUDE_REDIRECT] });
+    const base = {
+      clientId: client.client_id,
+      scopes: ["teamleader"],
+      resource: "https://mcp.example.com/mcp",
+    };
+    store.putAccessToken("expired", { ...base, expiresAt: Math.floor(Date.now() / 1000) - 10 });
+    // expiresAt 0 means "never" for a refresh token, so a sweep must not eat it.
+    store.putRefreshToken("eternal", { ...base, expiresAt: 0 });
+    store.close();
+
+    const reloaded = new OAuthStore(file, [CLAUDE_REDIRECT]);
+    expect(reloaded.getAccessToken("expired")).toBeUndefined();
+    expect(reloaded.consumeRefreshToken("eternal")?.clientId).toBe(client.client_id);
+    reloaded.close();
+  });
+
+  it("refuses to start on a corrupt store rather than dropping every client", () => {
+    const bad = join(dir, "corrupt.json");
+    writeFileSync(bad, "{not json");
+    expect(() => new OAuthStore(bad, [CLAUDE_REDIRECT])).toThrow(/Could not read the OAuth store/);
+  });
+
+  it("starts clean when the file does not exist yet", () => {
+    const fresh = join(dir, "nested", "new-store.json");
+    const store = new OAuthStore(fresh, [CLAUDE_REDIRECT]);
+    expect(store.countClients()).toBe(0);
+    store.close();
+    expect(existsSync(fresh)).toBe(true);
   });
 });
 
