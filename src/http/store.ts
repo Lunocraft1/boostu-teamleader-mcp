@@ -57,6 +57,8 @@ export interface AuthCodeRecord {
   codeChallenge: string;
   scopes: string[];
   resource?: string;
+  /** Account that approved the request on the consent screen. */
+  username?: string;
   expiresAt: number;
 }
 
@@ -64,6 +66,11 @@ export interface TokenRecord {
   clientId: string;
   scopes: string[];
   resource: string;
+  /**
+   * Account this token was issued to. Optional only so a store file written
+   * before accounts existed still loads.
+   */
+  username?: string;
   /** Absolute epoch seconds; 0 means "does not expire" (refresh tokens only). */
   expiresAt: number;
 }

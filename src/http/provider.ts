@@ -5,6 +5,10 @@
  * /register handlers can be reused. Everything user-facing (the consent page)
  * lives in consent.ts; `authorize()` only parks the validated request and
  * redirects there.
+ *
+ * Tokens are bound to one endpoint via their audience. That is the mechanism
+ * that keeps a token issued for the read-only briefing endpoint from being
+ * usable against the writable one.
  */
 
 import type { Response } from "express";
@@ -23,8 +27,14 @@ import {
   InvalidTargetError,
   InvalidTokenError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js";
-import { canonicalizeResource, type HttpConfig } from "./config.js";
+import {
+  canonicalizeResource,
+  endpointForResource,
+  type HttpConfig,
+  type McpEndpointConfig,
+} from "./config.js";
 import { OAuthStore, randomToken } from "./store.js";
+import { OFFLINE_ACCESS } from "./metadata.js";
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
@@ -41,20 +51,36 @@ export class LocalOAuthProvider implements OAuthServerProvider {
   }
 
   /**
-   * Resolves the audience for a grant.
+   * Resolves which endpoint a grant is for.
    *
    * A client that asks for a resource we do not serve gets `invalid_target`
-   * rather than a token that would fail validation later.
+   * rather than a token that would fail validation later. With no resource at
+   * all — a client that predates RFC 8707 — the writable endpoint is assumed,
+   * since that is the URL a person enters by hand.
    */
-  private resolveAudience(requested?: URL): string {
-    if (!requested) return this.config.resource;
-    const canonical = canonicalizeResource(requested.href);
-    if (!this.config.allowedAudiences.includes(canonical)) {
+  private resolveEndpoint(requested?: URL): McpEndpointConfig {
+    if (!requested) return this.config.work;
+    const endpoint = endpointForResource(this.config, requested.href);
+    if (!endpoint) {
       throw new InvalidTargetError(
-        `This server does not issue tokens for resource "${canonical}".`
+        `This server does not issue tokens for resource ` +
+          `"${canonicalizeResource(requested.href)}".`
       );
     }
-    return canonical;
+    return endpoint;
+  }
+
+  /**
+   * The scopes a grant actually receives.
+   *
+   * Always includes the endpoint's own scope, so the token works where it was
+   * requested, plus offline_access when asked for (Claude appends it to obtain
+   * a refresh token). Nothing else is granted, whatever was requested.
+   */
+  private grantedScopes(endpoint: McpEndpointConfig, requested?: string[]): string[] {
+    const scopes = [endpoint.scope];
+    if (requested?.includes(OFFLINE_ACCESS)) scopes.push(OFFLINE_ACCESS);
+    return scopes;
   }
 
   // ── Authorization endpoint ────────────────────────────────────────────────
@@ -70,14 +96,14 @@ export class LocalOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
-    const audience = this.resolveAudience(params.resource);
+    const endpoint = this.resolveEndpoint(params.resource);
     const requestId = this.store.createPendingAuth({
       clientId: client.client_id,
       redirectUri: params.redirectUri,
       codeChallenge: params.codeChallenge,
       state: params.state,
-      scopes: params.scopes ?? [],
-      resource: audience,
+      scopes: this.grantedScopes(endpoint, params.scopes),
+      resource: endpoint.resource,
     });
     res.redirect(302, `/consent?rid=${encodeURIComponent(requestId)}`);
   }
@@ -117,12 +143,12 @@ export class LocalOAuthProvider implements OAuthServerProvider {
       throw new InvalidGrantError("redirect_uri does not match the authorization request.");
     }
 
-    const granted = record.resource ?? this.config.resource;
+    const granted = record.resource ?? this.config.work.resource;
     if (resource && canonicalizeResource(resource.href) !== granted) {
       throw new InvalidTargetError("resource does not match the authorization request.");
     }
 
-    return this.issueTokens(client.client_id, record.scopes, granted);
+    return this.issueTokens(client.client_id, record.scopes, granted, record.username);
   }
 
   async exchangeRefreshToken(
@@ -146,10 +172,15 @@ export class LocalOAuthProvider implements OAuthServerProvider {
     if (scopes?.length && granted.length !== scopes.length) {
       throw new InvalidGrantError("Requested scope exceeds the original grant.");
     }
-    return this.issueTokens(client.client_id, granted, record.resource);
+    return this.issueTokens(client.client_id, granted, record.resource, record.username);
   }
 
-  private issueTokens(clientId: string, scopes: string[], resource: string): OAuthTokens {
+  private issueTokens(
+    clientId: string,
+    scopes: string[],
+    resource: string,
+    username?: string
+  ): OAuthTokens {
     const accessToken = randomToken();
     const refreshToken = randomToken();
     const accessExpiresAt = nowSec() + this.config.accessTokenTtlSec;
@@ -160,12 +191,14 @@ export class LocalOAuthProvider implements OAuthServerProvider {
       clientId,
       scopes,
       resource,
+      username,
       expiresAt: accessExpiresAt,
     });
     this.store.putRefreshToken(refreshToken, {
       clientId,
       scopes,
       resource,
+      username,
       expiresAt: refreshExpiresAt,
     });
 
@@ -181,12 +214,14 @@ export class LocalOAuthProvider implements OAuthServerProvider {
   // ── Resource server ───────────────────────────────────────────────────────
 
   /**
-   * Validates a bearer token presented at the MCP endpoint.
+   * Validates a bearer token presented at an MCP endpoint.
    *
    * The audience check is done here on purpose: the SDK's requireBearerAuth
    * middleware verifies scopes and expiry but never compares AuthInfo.resource
    * against anything, so a token minted for another resource would otherwise be
-   * accepted. The MCP specification requires rejecting it.
+   * accepted. This rejects an audience this server never issues; matching the
+   * token to the *specific* endpoint it was presented to happens in
+   * requireAudience, which is the check that separates the two endpoints.
    */
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const record = this.store.getAccessToken(token);
@@ -198,9 +233,7 @@ export class LocalOAuthProvider implements OAuthServerProvider {
       throw new InvalidTokenError("Access token has expired.");
     }
     if (!this.config.allowedAudiences.includes(canonicalizeResource(record.resource))) {
-      throw new InvalidTokenError(
-        "Access token was not issued for this resource server."
-      );
+      throw new InvalidTokenError("Access token was not issued for this resource server.");
     }
     return {
       token,
@@ -208,6 +241,7 @@ export class LocalOAuthProvider implements OAuthServerProvider {
       scopes: record.scopes,
       expiresAt: record.expiresAt,
       resource: new URL(record.resource),
+      extra: record.username ? { sub: record.username } : undefined,
     };
   }
 

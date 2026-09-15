@@ -3,10 +3,26 @@
  *
  * Everything the OAuth layer advertises about itself is derived from
  * PUBLIC_BASE_URL. That value becomes the issuer, the base of every metadata
- * document, and — together with MCP_PATH — the resource identifier that ends up
- * in the audience of every access token. It therefore has to match the URL that
- * is entered in claude.ai exactly; see docs/REMOTE.md.
+ * document, and — together with the endpoint paths — the resource identifiers
+ * that end up in the audience of every access token. It therefore has to match
+ * the URL entered in claude.ai exactly; see docs/REMOTE.md.
  */
+
+/** One MCP endpoint: its own resource identifier, scope and tool set. */
+export interface McpEndpointConfig {
+  /** Stable key used in logs and startup output. */
+  id: "work" | "briefing";
+  /** Human-readable name for the consent screen and metadata. */
+  name: string;
+  /** Path below the base URL, e.g. /mcp */
+  path: string;
+  /** RFC 8707 resource identifier, e.g. https://mcp.example.com/mcp */
+  resource: string;
+  /** Scope a token must carry to use this endpoint. */
+  scope: string;
+  /** When true, only non-mutating tools are served. */
+  readOnly: boolean;
+}
 
 export interface HttpConfig {
   /** Port the Node process listens on (nginx proxies to it). */
@@ -15,31 +31,32 @@ export interface HttpConfig {
   host: string;
   /** Issuer / base URL, without trailing slash, e.g. https://mcp.example.com */
   baseUrl: string;
-  /** Path of the MCP endpoint, e.g. /mcp */
-  mcpPath: string;
-  /** RFC 8707 resource identifier of this server, e.g. https://mcp.example.com/mcp */
-  resource: string;
+  /** The read/write endpoint, used interactively. */
+  work: McpEndpointConfig;
+  /** The read-only endpoint, used by the unattended briefing. */
+  briefing: McpEndpointConfig;
+  /** Both of the above, in advertising order. */
+  endpoints: McpEndpointConfig[];
   /**
-   * Audience values accepted when validating an access token. Contains the
-   * canonical resource and the bare origin, because clients differ in how
-   * specific a `resource` value they send.
+   * Audience values this server issues tokens for — exactly the endpoint
+   * resources, nothing wider. A token is additionally checked against the
+   * specific endpoint it is presented to, which is what keeps a briefing
+   * token from reaching the writable endpoint.
    */
   allowedAudiences: string[];
+  /** Union of endpoint scopes, for authorization server metadata. */
+  scopesSupported: string[];
   /** JSON file holding registered clients, codes and tokens. */
   dbPath: string;
-  /** scrypt hash of the consent password (see `npm run hash-password`). */
-  consentPasswordHash: string;
   /** Exact redirect URIs accepted at dynamic client registration. No wildcards. */
   allowedRedirectUris: string[];
   /** Access token lifetime in seconds. */
   accessTokenTtlSec: number;
   /** Refresh token lifetime in seconds; 0 means it does not expire. */
   refreshTokenTtlSec: number;
-  /** The single scope this resource server requires. */
-  scope: string;
   /** Value for Express' "trust proxy" setting. */
   trustProxy: number | boolean;
-  /** Origins accepted on the MCP endpoint; empty means any. */
+  /** Origins accepted on the MCP endpoints; empty means any. */
   allowedOrigins: string[];
 }
 
@@ -67,6 +84,10 @@ function listEnv(env: NodeJS.ProcessEnv, name: string, fallback: string[]): stri
   const raw = env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function normalisePath(raw: string): string {
+  return "/" + raw.trim().replace(/^\/+|\/+$/g, "");
 }
 
 /**
@@ -100,26 +121,57 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
   }
   const baseUrl = `${base.protocol}//${base.host}${base.pathname.replace(/\/$/, "")}`;
 
-  const mcpPath = "/" + (env.MCP_PATH ?? "/mcp").trim().replace(/^\/+|\/+$/g, "");
-  const resource = canonicalizeResource(`${baseUrl}${mcpPath}`);
-  const origin = canonicalizeResource(baseUrl);
+  const workPath = normalisePath(env.MCP_PATH ?? "/mcp");
+  const briefingPath = normalisePath(env.MCP_BRIEFING_PATH ?? "/mcp/briefing");
+  if (workPath === briefingPath) {
+    throw new Error("MCP_PATH and MCP_BRIEFING_PATH must differ.");
+  }
+
+  const work: McpEndpointConfig = {
+    id: "work",
+    name: "Teamleader Focus",
+    path: workPath,
+    resource: canonicalizeResource(`${baseUrl}${workPath}`),
+    scope: env.MCP_SCOPE?.trim() || "teamleader",
+    readOnly: false,
+  };
+  const briefing: McpEndpointConfig = {
+    id: "briefing",
+    name: "Teamleader Focus (read-only briefing)",
+    path: briefingPath,
+    resource: canonicalizeResource(`${baseUrl}${briefingPath}`),
+    scope: env.MCP_BRIEFING_SCOPE?.trim() || "teamleader.read",
+    readOnly: true,
+  };
+  if (work.scope === briefing.scope) {
+    throw new Error("MCP_SCOPE and MCP_BRIEFING_SCOPE must differ.");
+  }
+
+  const endpoints = [work, briefing];
 
   return {
     port: intEnv(env, "PORT", 8787),
     host: env.HOST?.trim() || "127.0.0.1",
     baseUrl,
-    mcpPath,
-    resource,
-    // A token minted for the bare origin is still a token for this server;
-    // anything else is not and is rejected in verifyAccessToken.
-    allowedAudiences: Array.from(new Set([resource, origin])),
+    work,
+    briefing,
+    endpoints,
+    allowedAudiences: endpoints.map((endpoint) => endpoint.resource),
+    scopesSupported: Array.from(new Set(endpoints.map((endpoint) => endpoint.scope))),
     dbPath: env.OAUTH_DB_PATH?.trim() || "./data/oauth-store.json",
-    consentPasswordHash: required(env, "MCP_CONSENT_PASSWORD_HASH"),
     allowedRedirectUris: listEnv(env, "OAUTH_ALLOWED_REDIRECT_URIS", [CLAUDE_REDIRECT_URI]),
     accessTokenTtlSec: intEnv(env, "ACCESS_TOKEN_TTL", 3600),
     refreshTokenTtlSec: intEnv(env, "REFRESH_TOKEN_TTL", 0),
-    scope: env.MCP_SCOPE?.trim() || "teamleader",
     trustProxy: intEnv(env, "TRUST_PROXY", 1),
     allowedOrigins: listEnv(env, "MCP_ALLOWED_ORIGINS", []),
   };
+}
+
+/** Finds the endpoint a resource identifier belongs to, if any. */
+export function endpointForResource(
+  config: HttpConfig,
+  resource: string
+): McpEndpointConfig | undefined {
+  const canonical = canonicalizeResource(resource);
+  return config.endpoints.find((endpoint) => endpoint.resource === canonical);
 }

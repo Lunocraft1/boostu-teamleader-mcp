@@ -10,6 +10,8 @@
 import { loadHttpConfig } from "./http/config.js";
 import { createApp } from "./http/app.js";
 import { OAuthStore } from "./http/store.js";
+import { UserStore } from "./http/users.js";
+import { BRIEFING_TOOLS } from "./http/readOnly.js";
 import { SerializedTeamleaderAuth, lockTokenStore } from "./http/teamleader.js";
 import { TeamleaderClient } from "./api/client.js";
 
@@ -45,16 +47,25 @@ async function main(): Promise<void> {
   const client = new TeamleaderClient(auth);
 
   const store = new OAuthStore(config.dbPath, config.allowedRedirectUris);
-  const app = createApp({ config, store, client });
+  const users = UserStore.load();
+  const app = createApp({ config, store, users, client });
 
   const server = app.listen(config.port, config.host, () => {
     console.log(`[teamleader-mcp] listening on http://${config.host}:${config.port}`);
-    console.log(`[teamleader-mcp] MCP endpoint      ${config.resource}`);
     console.log(`[teamleader-mcp] issuer            ${config.baseUrl}`);
-    console.log(`[teamleader-mcp] token store       ${process.env.TEAMLEADER_TOKEN_STORE ?? "(none)"}`);
-    console.log(`[teamleader-mcp] oauth database    ${config.dbPath}`);
-    console.log(`[teamleader-mcp] registered clients ${store.countClients()}`);
+    for (const endpoint of config.endpoints) {
+      const mode = endpoint.readOnly
+        ? `read-only, ${BRIEFING_TOOLS.size} tools allowed`
+        : "read/write";
+      console.log(
+        `[teamleader-mcp] endpoint          ${endpoint.resource}  (${mode}, scope "${endpoint.scope}")`
+      );
+    }
     console.log(`[teamleader-mcp] tool groups       ${process.env.TEAMLEADER_TOOLS ?? "(all)"}`);
+    console.log(`[teamleader-mcp] accounts          ${users.count()} (${users.usernames().join(", ")})`);
+    console.log(`[teamleader-mcp] token store       ${process.env.TEAMLEADER_TOKEN_STORE ?? "(none)"}`);
+    console.log(`[teamleader-mcp] oauth store       ${config.dbPath}`);
+    console.log(`[teamleader-mcp] registered clients ${store.countClients()}`);
   });
 
   let shuttingDown = false;

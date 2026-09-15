@@ -14,6 +14,8 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalizeResource, loadHttpConfig, type HttpConfig } from "../src/http/config.js";
+import { UserStore } from "../src/http/users.js";
+import { BRIEFING_TOOLS, createBriefingServer } from "../src/http/readOnly.js";
 import { hashPassword, verifyPassword } from "../src/http/password.js";
 import { OAuthStore } from "../src/http/store.js";
 import { LocalOAuthProvider } from "../src/http/provider.js";
@@ -37,6 +39,10 @@ function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): HttpConfig {
   } as NodeJS.ProcessEnv);
 }
 
+function testUsers(password = PASSWORD): UserStore {
+  return new UserStore([{ username: "malte", passwordHash: hashPassword(password) }]);
+}
+
 function pkce(): { verifier: string; challenge: string } {
   const verifier = randomBytes(32).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -57,9 +63,14 @@ describe("config", () => {
   it("derives issuer and resource from PUBLIC_BASE_URL", () => {
     const config = testConfig();
     expect(config.baseUrl).toBe("https://mcp.example.com");
-    expect(config.resource).toBe("https://mcp.example.com/mcp");
-    expect(config.allowedAudiences).toContain("https://mcp.example.com/mcp");
-    expect(config.allowedAudiences).toContain("https://mcp.example.com");
+    expect(config.work.resource).toBe("https://mcp.example.com/mcp");
+    expect(config.briefing.resource).toBe("https://mcp.example.com/mcp/briefing");
+    // Exactly the two endpoint resources: a wider audience (the bare origin,
+    // say) would be accepted at both endpoints and defeat the separation.
+    expect(config.allowedAudiences).toEqual([
+      "https://mcp.example.com/mcp",
+      "https://mcp.example.com/mcp/briefing",
+    ]);
   });
 
   it("defaults the redirect URI allowlist to Claude's callback only", () => {
@@ -110,11 +121,11 @@ describe("metadata documents", () => {
     // Claude appends offline_access only when the AS lists it, and the MCP spec
     // says the resource must not require it.
     expect(authorizationServerMetadata(config).scopes_supported).toContain("offline_access");
-    expect(protectedResourceMetadata(config).scopes_supported).not.toContain("offline_access");
+    expect(protectedResourceMetadata(config, config.work).scopes_supported).not.toContain("offline_access");
   });
 
   it("names this server as the resource and itself as the authorization server", () => {
-    const prm = protectedResourceMetadata(config);
+    const prm = protectedResourceMetadata(config, config.work);
     expect(prm.resource).toBe("https://mcp.example.com/mcp");
     expect(prm.authorization_servers).toEqual(["https://mcp.example.com"]);
   });
@@ -209,6 +220,96 @@ describe("store persistence", () => {
   });
 });
 
+describe("accounts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tl-mcp-users-"));
+  const file = join(dir, "users.json");
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("accepts the password without a name while there is one account", () => {
+    const users = new UserStore([{ username: "malte", passwordHash: hashPassword(PASSWORD) }]);
+    expect(users.isSingleUser).toBe(true);
+    expect(users.verify(undefined, PASSWORD)).toBe("malte");
+    expect(users.verify("malte", PASSWORD)).toBe("malte");
+    expect(users.verify(undefined, "wrong")).toBeUndefined();
+  });
+
+  it("requires the name once a second account exists, with no code change", () => {
+    const users = new UserStore([
+      { username: "malte", passwordHash: hashPassword(PASSWORD) },
+      { username: "kollege", passwordHash: hashPassword("zweites-passwort") },
+    ]);
+    expect(users.isSingleUser).toBe(false);
+    // Ambiguous without a name, so it must not authenticate anyone.
+    expect(users.verify(undefined, PASSWORD)).toBeUndefined();
+    expect(users.verify("malte", PASSWORD)).toBe("malte");
+    expect(users.verify("kollege", "zweites-passwort")).toBe("kollege");
+    // No credential sharing between accounts.
+    expect(users.verify("kollege", PASSWORD)).toBeUndefined();
+    expect(users.verify("unbekannt", PASSWORD)).toBeUndefined();
+  });
+
+  it("stores accounts in a file so a second one is a config change", () => {
+    const store = UserStore.initFile(file);
+    store.addUser("malte", PASSWORD);
+    store.addUser("kollege", "zweites-passwort");
+
+    const reloaded = UserStore.load({ MCP_USERS_FILE: file } as NodeJS.ProcessEnv);
+    expect(reloaded.usernames().sort()).toEqual(["kollege", "malte"]);
+    expect(reloaded.verify("kollege", "zweites-passwort")).toBe("kollege");
+  });
+
+  it("changes and removes accounts, but never the last one", () => {
+    const store = UserStore.load({ MCP_USERS_FILE: file } as NodeJS.ProcessEnv);
+    store.setPassword("kollege", "neues-passwort");
+    expect(store.verify("kollege", "neues-passwort")).toBe("kollege");
+
+    store.removeUser("kollege");
+    expect(store.usernames()).toEqual(["malte"]);
+    expect(() => store.removeUser("malte")).toThrow(/last account/);
+    expect(() => store.removeUser("niemand")).toThrow(/No such user/);
+  });
+
+  it("falls back to the single-hash environment variable", () => {
+    const users = UserStore.load({
+      MCP_CONSENT_PASSWORD_HASH: hashPassword(PASSWORD),
+    } as NodeJS.ProcessEnv);
+    expect(users.usernames()).toEqual(["admin"]);
+    expect(users.verify(undefined, PASSWORD)).toBe("admin");
+  });
+
+  it("refuses to start with no login configured", () => {
+    expect(() => UserStore.load({} as NodeJS.ProcessEnv)).toThrow(/No login configured/);
+  });
+});
+
+describe("read-only briefing server", () => {
+  const auth = new TeamleaderAuth({ clientId: "", clientSecret: "", refreshToken: "" });
+  const client = new TeamleaderClient(auth);
+
+  it("registers only non-mutating tools", () => {
+    const { registered, skipped } = createBriefingServer(client);
+    expect(registered.length).toBeGreaterThan(0);
+    expect(skipped.length).toBeGreaterThan(0);
+    for (const name of registered) expect(BRIEFING_TOOLS.has(name)).toBe(true);
+  });
+
+  it("excludes every write tool by name", () => {
+    const { registered } = createBriefingServer(client);
+    const forbidden = /_(create|update|delete|close|reopen|duplicate|assign|unassign|add|remove|link|unlink|complete)(_|$)/;
+    const writeTools = registered.filter((name) => forbidden.test(name));
+    expect(writeTools).toEqual([]);
+  });
+
+  it("drops the write tools the interactive server keeps", () => {
+    const { skipped } = createBriefingServer(client);
+    // Spot-check the ones that would be visible to a customer if they ran.
+    expect(skipped).toContain("teamleader_create_event");
+    expect(skipped).toContain("teamleader_create_task");
+    expect(skipped).toContain("teamleader_create_company");
+    expect(skipped).toContain("teamleader_update_deal");
+  });
+});
+
 describe("provider grants", () => {
   function setup() {
     const config = testConfig();
@@ -225,13 +326,13 @@ describe("provider grants", () => {
       clientId: client.client_id,
       redirectUri: CLAUDE_REDIRECT,
       codeChallenge: challenge,
-      scopes: [config.scope],
-      resource: config.resource,
+      scopes: [config.work.scope],
+      resource: config.work.resource,
     });
     const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, CLAUDE_REDIRECT);
     const info = await provider.verifyAccessToken(tokens.access_token);
-    expect(info.resource?.href).toBe(`${config.resource}`);
-    expect(info.scopes).toEqual([config.scope]);
+    expect(info.resource?.href).toBe(`${config.work.resource}`);
+    expect(info.scopes).toEqual([config.work.scope]);
     store.close();
   });
 
@@ -242,8 +343,8 @@ describe("provider grants", () => {
       clientId: client.client_id,
       redirectUri: CLAUDE_REDIRECT,
       codeChallenge: challenge,
-      scopes: [config.scope],
-      resource: config.resource,
+      scopes: [config.work.scope],
+      resource: config.work.resource,
     });
     await provider.exchangeAuthorizationCode(client, code, undefined, CLAUDE_REDIRECT);
     await expect(
@@ -259,8 +360,8 @@ describe("provider grants", () => {
       clientId: client.client_id,
       redirectUri: CLAUDE_REDIRECT,
       codeChallenge: challenge,
-      scopes: [config.scope],
-      resource: config.resource,
+      scopes: [config.work.scope],
+      resource: config.work.resource,
     });
     await expect(
       provider.exchangeAuthorizationCode(client, code, undefined, "https://claude.ai/other")
@@ -275,8 +376,8 @@ describe("provider grants", () => {
       clientId: client.client_id,
       redirectUri: CLAUDE_REDIRECT,
       codeChallenge: challenge,
-      scopes: [config.scope],
-      resource: config.resource,
+      scopes: [config.work.scope],
+      resource: config.work.resource,
     });
     const first = await provider.exchangeAuthorizationCode(client, code, undefined, CLAUDE_REDIRECT);
     const second = await provider.exchangeRefreshToken(client, first.refresh_token!);
@@ -313,7 +414,7 @@ describe("provider grants", () => {
     const foreign = "foreign-token";
     store.putAccessToken(foreign, {
       clientId: client.client_id,
-      scopes: [config.scope],
+      scopes: [config.work.scope],
       resource: "https://someone-else.example.com/mcp",
       expiresAt: Math.floor(Date.now() / 1000) + 600,
     });
@@ -327,8 +428,8 @@ describe("provider grants", () => {
     const { config, store, provider, client } = setup();
     store.putAccessToken("stale", {
       clientId: client.client_id,
-      scopes: [config.scope],
-      resource: config.resource,
+      scopes: [config.work.scope],
+      resource: config.work.resource,
       expiresAt: Math.floor(Date.now() / 1000) - 1,
     });
     await expect(provider.verifyAccessToken("stale")).rejects.toThrow(/expired/);
@@ -347,12 +448,12 @@ describe("provider grants", () => {
       clientId: client.client_id,
       redirectUri: CLAUDE_REDIRECT,
       codeChallenge: pkce().challenge,
-      scopes: [config.scope],
-      resource: config.resource,
+      scopes: [config.work.scope],
+      resource: config.work.resource,
     });
     const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, CLAUDE_REDIRECT);
     await expect(
-      provider.exchangeRefreshToken(client, tokens.refresh_token!, [config.scope, "admin"])
+      provider.exchangeRefreshToken(client, tokens.refresh_token!, [config.work.scope, "admin"])
     ).rejects.toThrow(/exceeds the original grant/);
     store.close();
   });
@@ -367,7 +468,7 @@ describe("HTTP surface", () => {
   beforeAll(async () => {
     store = new OAuthStore(":memory:", config.allowedRedirectUris);
     const auth = new TeamleaderAuth({ clientId: "", clientSecret: "", refreshToken: "" });
-    const app = createApp({ config, store, client: new TeamleaderClient(auth) });
+    const app = createApp({ config, store, users: testUsers(), client: new TeamleaderClient(auth) });
     await new Promise<void>((resolve) => {
       server = app.listen(0, "127.0.0.1", () => resolve());
     });
@@ -400,7 +501,7 @@ describe("HTTP surface", () => {
       'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"'
     );
     // Claude uses the scope hint to decide what to request during authorization.
-    expect(header).toContain(`scope="${config.scope}"`);
+    expect(header).toContain(`scope="${config.work.scope}"`);
   });
 
   it("rejects a bearer token it never issued", async () => {
@@ -486,7 +587,7 @@ describe("HTTP surface", () => {
       redirect_uri: CLAUDE_REDIRECT,
       code_challenge: "plain-challenge",
       code_challenge_method: "plain",
-      resource: config.resource,
+      resource: config.work.resource,
     });
     const res = await fetch(`${base}/authorize?${params}`, { redirect: "manual" });
     // Rejected post-validation, so the error is delivered to the redirect URI.
@@ -517,9 +618,9 @@ describe("HTTP surface", () => {
       redirect_uri: CLAUDE_REDIRECT,
       code_challenge: pkce().challenge,
       code_challenge_method: "S256",
-      scope: config.scope,
+      scope: config.work.scope,
       state: "xyz",
-      resource: config.resource,
+      resource: config.work.resource,
     });
     const res = await fetch(`${base}/authorize?${params}`, { redirect: "manual" });
     expect(res.status).toBe(302);
@@ -534,6 +635,139 @@ describe("HTTP surface", () => {
     }
   });
 
+  /** Runs the whole flow and returns an access token for one endpoint. */
+  async function tokenFor(resource: string): Promise<string> {
+    const client = store.registerClient({ redirect_uris: [CLAUDE_REDIRECT] });
+    const { verifier, challenge } = pkce();
+    const authRes = await fetch(
+      `${base}/authorize?` +
+        new URLSearchParams({
+          response_type: "code",
+          client_id: client.client_id,
+          redirect_uri: CLAUDE_REDIRECT,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          resource,
+        }),
+      { redirect: "manual" }
+    );
+    const rid = new URL(authRes.headers.get("location")!, base).searchParams.get("rid")!;
+    const consent = await fetch(`${base}/consent`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ rid, password: PASSWORD }).toString(),
+      redirect: "manual",
+    });
+    const code = new URL(consent.headers.get("location")!).searchParams.get("code")!;
+    const tokenRes = await fetch(`${base}/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: client.client_id,
+        code,
+        code_verifier: verifier,
+        redirect_uri: CLAUDE_REDIRECT,
+        resource,
+      }).toString(),
+    });
+    return (await tokenRes.json()).access_token as string;
+  }
+
+  async function rpc(path: string, token: string, body: unknown): Promise<Response> {
+    return fetch(`${base}${path}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("keeps the two endpoints apart: a token works only where it was issued", async () => {
+    const workToken = await tokenFor(config.work.resource);
+    const briefingToken = await tokenFor(config.briefing.resource);
+    const list = { jsonrpc: "2.0", id: 1, method: "tools/list" };
+
+    // Each token works on its own endpoint ...
+    expect((await rpc(config.work.path, workToken, list)).status).toBe(200);
+    expect((await rpc(config.briefing.path, briefingToken, list)).status).toBe(200);
+
+    // ... and nowhere else. This is the guarantee that the unattended briefing
+    // cannot reach the writable endpoint.
+    const crossed = await rpc(config.work.path, briefingToken, list);
+    expect(crossed.status).toBe(401);
+    expect(crossed.headers.get("www-authenticate")).toContain('error="invalid_token"');
+
+    expect((await rpc(config.briefing.path, workToken, list)).status).toBe(401);
+  });
+
+  it("serves no write tools on the briefing endpoint", async () => {
+    const token = await tokenFor(config.briefing.resource);
+    const res = await rpc(config.briefing.path, token, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+    });
+    const names: string[] = (await res.json()).result.tools.map((t: { name: string }) => t.name);
+    expect(names.length).toBeGreaterThan(0);
+    expect(names).toContain("teamleader_list_events");
+    expect(names).toContain("teamleader_users_list");
+    expect(names).not.toContain("teamleader_create_event");
+    expect(names).not.toContain("teamleader_create_task");
+    for (const name of names) expect(BRIEFING_TOOLS.has(name)).toBe(true);
+  });
+
+  it("serves write tools on the interactive endpoint", async () => {
+    const token = await tokenFor(config.work.resource);
+    const res = await rpc(config.work.path, token, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+    });
+    const names: string[] = (await res.json()).result.tools.map((t: { name: string }) => t.name);
+    expect(names).toContain("teamleader_create_event");
+    expect(names.length).toBeGreaterThan(BRIEFING_TOOLS.size);
+  });
+
+  it("refuses a briefing tool call that does not exist there", async () => {
+    const token = await tokenFor(config.briefing.resource);
+    const res = await rpc(config.briefing.path, token, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "teamleader_create_event", arguments: {} },
+    });
+    // Reached the MCP layer, which has no such tool registered.
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.error ?? body.result?.isError).toBeTruthy();
+  });
+
+  it("serves protected resource metadata for the briefing endpoint", async () => {
+    const res = await fetch(`${base}/.well-known/oauth-protected-resource/mcp/briefing`);
+    expect(res.status).toBe(200);
+    const prm = await res.json();
+    expect(prm.resource).toBe("https://mcp.example.com/mcp/briefing");
+    expect(prm.scopes_supported).toEqual([config.briefing.scope]);
+  });
+
+  it("challenges the briefing endpoint with its own scope and metadata URL", async () => {
+    const res = await fetch(`${base}${config.briefing.path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(res.status).toBe(401);
+    const header = res.headers.get("www-authenticate") ?? "";
+    expect(header).toContain(`scope="${config.briefing.scope}"`);
+    expect(header).toContain(
+      'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp/briefing"'
+    );
+  });
+
   it("completes the full authorization code flow with PKCE", async () => {
     const client = store.registerClient({ redirect_uris: [CLAUDE_REDIRECT] });
     const { verifier, challenge } = pkce();
@@ -545,9 +779,9 @@ describe("HTTP surface", () => {
       redirect_uri: CLAUDE_REDIRECT,
       code_challenge: challenge,
       code_challenge_method: "S256",
-      scope: config.scope,
+      scope: config.work.scope,
       state: "state-123",
-      resource: config.resource,
+      resource: config.work.resource,
     });
     const authRes = await fetch(`${base}/authorize?${authParams}`, { redirect: "manual" });
     const rid = new URL(authRes.headers.get("location")!, base).searchParams.get("rid")!;
@@ -601,7 +835,7 @@ describe("HTTP surface", () => {
         code,
         code_verifier: verifier,
         redirect_uri: CLAUDE_REDIRECT,
-        resource: config.resource,
+        resource: config.work.resource,
       }).toString(),
     });
     expect(tokenRes.status).toBe(200);

@@ -12,6 +12,8 @@ changes can be merged without touching any of this.
 
 | Decision | Reason |
 |---|---|
+| Two endpoints, separated by token audience | The briefing runs unattended on a schedule. A scheduled run that writes to the CRM is visible to customers, so the read-only endpoint must be incapable of writing, not merely expected not to. `/mcp/briefing` serves only non-mutating tools and accepts only tokens minted for its own resource identifier. |
+| Accounts in a file, not in code | One user today, but adding a second is a file edit (`npm run user -- add`) rather than a rewrite, and every token records which account approved it. |
 | Stateless Streamable HTTP (`sessionIdGenerator: undefined`, `enableJsonResponse: true`) | A fresh transport and `McpServer` per POST means there is no per-connection state to lose on restart. Only tokens persist, and those are in SQLite. |
 | No SSE fallback | The GET/SSE stream and protocol-level sessions were removed in MCP revision `2026-07-28`; Claude speaks Streamable HTTP over POST. Adding SSE would mean maintaining a transport that is on its way out. |
 | Resource server and authorization server in one process | Claude fetches protected resource metadata from the MCP host and then discovers the authorization server separately. Same host means one certificate, one nginx block, and no second WAF to get wrong. |
@@ -24,12 +26,14 @@ changes can be merged without touching any of this.
 
 | Path | Auth | Purpose |
 |---|---|---|
-| `POST /mcp` | Bearer | The MCP endpoint. Unauthenticated requests get `401` + `WWW-Authenticate`. |
+| `POST /mcp` | Bearer (`teamleader`) | Read/write MCP endpoint for interactive use. |
+| `POST /mcp/briefing` | Bearer (`teamleader.read`) | Read-only MCP endpoint for the unattended briefing. |
 | `GET /healthz` | none | Liveness, plus resource/issuer and registered-client count. |
-| `GET /.well-known/oauth-protected-resource[/mcp]` | none | RFC 9728. Served at both the sub-path and the root. |
+| `GET /.well-known/oauth-protected-resource/mcp` | none | RFC 9728 metadata for the read/write endpoint. Also served at the root as a fallback. |
+| `GET /.well-known/oauth-protected-resource/mcp/briefing` | none | RFC 9728 metadata for the read-only endpoint. |
 | `GET /.well-known/oauth-authorization-server` | none | RFC 8414. |
 | `GET|POST /authorize` | none | Authorization endpoint; redirects to the consent page. |
-| `GET|POST /consent` | password | The single-user login and consent screen. |
+| `GET|POST /consent` | password | Login and consent screen. Shows which endpoint is being authorized and whether it can write. |
 | `POST /register` | none | RFC 7591 dynamic client registration. |
 | `POST /token` | client | Authorization code and refresh token grants. |
 | `POST /revoke` | client | RFC 7009 revocation. |
@@ -61,6 +65,44 @@ Two further details that are easy to get wrong:
   require it.
 - Registered client secrets never expire (`clientSecretExpirySeconds: 0`). The
   SDK's 30-day default would break an unattended connector for no gain.
+
+## The two endpoints
+
+Both are served by the same process over the same Teamleader connection, and
+they differ in two independent ways:
+
+1. **Tool set.** `/mcp/briefing` registers only the tools in `BRIEFING_TOOLS`
+   (`src/http/readOnly.ts`) — an allowlist of non-mutating tools, so a tool
+   upstream adds later is absent until it is named there explicitly. The write
+   tools are not merely hidden; they are never registered, so nothing can call
+   them.
+2. **Token audience.** Each endpoint has its own resource identifier and scope.
+   A token minted for the briefing endpoint is refused at `/mcp` with `401
+   invalid_token`, and vice versa.
+
+The audience check deliberately runs *before* the scope check. A token for the
+wrong resource is `invalid_token` (401), not `insufficient_scope` (403) — the
+latter would invite the client to re-authorize for broader permissions, which
+is the wrong answer when the token simply belongs to another endpoint.
+
+Register `https://mcp.von-falken.de/mcp/briefing` as the connector for the
+scheduled briefing, and `https://mcp.von-falken.de/mcp` for interactive work.
+
+### Known coverage gaps, upstream
+
+These are limits of the upstream repo, not of this fork, and worth knowing
+before relying on them:
+
+- **Tasks (Teamleader todos)** can be listed and created, but not changed or
+  completed.
+- **Events** can be listed, read and created, but not moved or cancelled.
+- **Planned calls / follow-ups** (`calls.list`, `calls.add`, `calls.complete`)
+  live in the `activities` tool group, which is *not* enabled — and the
+  Teamleader integration has no Calls scope ticked, so enabling the group would
+  fail with a rights error until that scope is added in the dev portal.
+- Write paths in general are, per the upstream maintainer, implemented from the
+  documentation and not all verified against a real account. Try each one
+  against a dummy record before relying on it.
 
 ## Concurrency: the one thing that will silently destroy the setup
 
@@ -122,12 +164,15 @@ npm ci && npm run build && npm prune --omit=dev
 ```
 
 Write `/etc/teamleader-mcp.env` from `.env.remote.example` (`chmod 600`,
-owned by root — systemd reads it before dropping privileges), including the
-consent password hash:
+owned by root — systemd reads it before dropping privileges), then create the
+first account:
 
 ```bash
-npm run hash-password -- 'your consent password'
+MCP_USERS_FILE=/var/lib/teamleader-mcp/users.json npm run user -- add malte
 ```
+
+Adding a second person later is the same command; no code change and no
+redeploy, just a restart so the file is re-read.
 
 Then:
 
@@ -178,7 +223,11 @@ curl -s https://mcp.von-falken.de/.well-known/oauth-authorization-server | jq
 curl -sI https://mcp.von-falken.de/mcp | head -1   # must NOT be a 3xx to another host
 ```
 
-**2. MCP Inspector, which walks the whole OAuth flow and shows where it stops:**
+**2. Endpoint separation:** obtain a token for the briefing endpoint and
+confirm it is refused at `/mcp` with `401` (see the test
+"keeps the two endpoints apart" for the exact sequence).
+
+**3. MCP Inspector, which walks the whole OAuth flow and shows where it stops:**
 
 Add the Inspector's callback to the allowlist first, restart, and remove it
 afterwards:
@@ -193,15 +242,15 @@ npx @modelcontextprotocol/inspector
 # Transport: Streamable HTTP, URL: https://mcp.von-falken.de/mcp
 ```
 
-**3. A Teamleader read**, in the Inspector: run `teamleader_users_list`, then
+**4. A Teamleader read**, in the Inspector: run `teamleader_users_list`, then
 `teamleader_list_events` with `starts_after` / `starts_before` bracketing today.
 
-**4. claude.ai:** Settings → Connectors → **Add custom connector**, URL
+**5. claude.ai:** Settings → Connectors → **Add custom connector**, URL
 `https://mcp.von-falken.de/mcp`, authentication **Always required**, OAuth client
 **No client ID — register one automatically** (DCR). New connectors can only be
 added from the web or desktop app, not the mobile apps.
 
-**5. Check the tools actually arrive.** In a fresh chat, open the **+** menu →
+**6. Check the tools actually arrive.** In a fresh chat, open the **+** menu →
 **Connectors** and confirm the tools are listed. A connector can show as
 connected and still deliver no tools; `journalctl -u teamleader-mcp -f` shows
 whether a `tools/list` even arrived (`rpc=tools/list` in the log line). If it

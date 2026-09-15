@@ -1,13 +1,14 @@
 /**
  * OAuth discovery documents.
  *
- * Written by hand rather than via the SDK's mcpAuthRouter for two reasons:
+ * Written by hand rather than via the SDK's mcpAuthRouter for three reasons:
  *
- *  1. The protected resource metadata has to be served at BOTH
- *     /.well-known/oauth-protected-resource/<mcp-path> and at the root.
- *     Clients try the path-specific form first and fall back to the root; the
- *     SDK only mounts the path-specific one.
- *  2. `offline_access` must appear in the authorization server's
+ *  1. There are two protected resources (the writable endpoint and the
+ *     read-only briefing endpoint), each needing its own metadata document.
+ *  2. Protected resource metadata has to be served at BOTH the path-specific
+ *     URL and the root. Clients try the path-specific form first and fall back
+ *     to the root; the SDK only mounts the path-specific one.
+ *  3. `offline_access` must appear in the authorization server's
  *     scopes_supported (that is how Claude knows to ask for a refresh token)
  *     but must NOT appear in the protected resource metadata, which the MCP
  *     spec reserves for scopes the resource itself requires.
@@ -15,7 +16,7 @@
 
 import { Router, type Request, type Response } from "express";
 import cors from "cors";
-import type { HttpConfig } from "./config.js";
+import type { HttpConfig, McpEndpointConfig } from "./config.js";
 
 /** Scope Claude appends when the AS advertises it, to obtain a refresh token. */
 export const OFFLINE_ACCESS = "offline_access";
@@ -34,20 +35,23 @@ export function authorizationServerMetadata(config: HttpConfig): Record<string, 
     revocation_endpoint_auth_methods_supported: ["client_secret_post", "none"],
     // PKCE is mandatory and S256-only. Clients refuse to proceed if this is absent.
     code_challenge_methods_supported: ["S256"],
-    scopes_supported: [config.scope, OFFLINE_ACCESS],
+    scopes_supported: [...config.scopesSupported, OFFLINE_ACCESS],
     // RFC 9207 — we always include `iss` on the authorization response.
     authorization_response_iss_parameter_supported: true,
     service_documentation: "https://github.com/boostuagency/boostu-teamleader-mcp",
   };
 }
 
-export function protectedResourceMetadata(config: HttpConfig): Record<string, unknown> {
+export function protectedResourceMetadata(
+  config: HttpConfig,
+  endpoint: McpEndpointConfig
+): Record<string, unknown> {
   return {
-    resource: config.resource,
+    resource: endpoint.resource,
     authorization_servers: [config.baseUrl],
-    scopes_supported: [config.scope],
+    scopes_supported: [endpoint.scope],
     bearer_methods_supported: ["header"],
-    resource_name: "Teamleader Focus",
+    resource_name: endpoint.name,
     resource_documentation: "https://github.com/boostuagency/boostu-teamleader-mcp",
   };
 }
@@ -64,19 +68,28 @@ export function metadataRouter(config: HttpConfig): Router {
 
   router.get("/.well-known/oauth-authorization-server", send(authorizationServerMetadata(config)));
 
-  const prm = protectedResourceMetadata(config);
-  // Path-specific form (tried first when the resource URL has a path) …
-  router.get(`/.well-known/oauth-protected-resource${config.mcpPath}`, send(prm));
-  // … and the root form clients fall back to.
-  router.get("/.well-known/oauth-protected-resource", send(prm));
+  for (const endpoint of config.endpoints) {
+    router.get(
+      `/.well-known/oauth-protected-resource${endpoint.path}`,
+      send(protectedResourceMetadata(config, endpoint))
+    );
+  }
+
+  // Root fallback. A client that probes the root cannot say which endpoint it
+  // means, so it gets the writable one — the same document the path-specific
+  // URL for that endpoint returns.
+  router.get(
+    "/.well-known/oauth-protected-resource",
+    send(protectedResourceMetadata(config, config.work))
+  );
 
   return router;
 }
 
 /**
  * The URL advertised in the `resource_metadata` parameter of the
- * WWW-Authenticate challenge on 401 responses.
+ * WWW-Authenticate challenge on 401 responses from a given endpoint.
  */
-export function resourceMetadataUrl(config: HttpConfig): string {
-  return `${config.baseUrl}/.well-known/oauth-protected-resource${config.mcpPath}`;
+export function resourceMetadataUrl(config: HttpConfig, endpoint: McpEndpointConfig): string {
+  return `${config.baseUrl}/.well-known/oauth-protected-resource${endpoint.path}`;
 }

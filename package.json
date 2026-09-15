@@ -23,7 +23,8 @@
     "test:watch": "vitest",
     "dev:http": "tsx src/http.ts",
     "start:http": "node dist/http.js",
-    "hash-password": "tsx src/http/hashPassword.ts"
+    "hash-password": "tsx src/http/hashPassword.ts",
+    "user": "tsx src/http/manageUsers.ts"
   },
   "keywords": [
     "mcp",
