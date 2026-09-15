@@ -205,18 +205,36 @@ describe("store persistence", () => {
     reloaded.close();
   });
 
+  it("does not write on close, so an edit made while running is not clobbered", () => {
+    const store = new OAuthStore(file, [CLAUDE_REDIRECT]);
+    store.registerClient({ client_name: "Bleibt", redirect_uris: [CLAUDE_REDIRECT] });
+
+    // Simulate an operator editing the file out from under a running process
+    // (removing a client by hand), then the process shutting down.
+    writeFileSync(file, JSON.stringify({ version: 1, clients: {}, pendingAuth: {},
+      authCodes: {}, accessTokens: {}, refreshTokens: {} }));
+    store.close();
+
+    expect(new OAuthStore(file, [CLAUDE_REDIRECT]).countClients()).toBe(0);
+  });
+
   it("refuses to start on a corrupt store rather than dropping every client", () => {
     const bad = join(dir, "corrupt.json");
     writeFileSync(bad, "{not json");
     expect(() => new OAuthStore(bad, [CLAUDE_REDIRECT])).toThrow(/Could not read the OAuth store/);
   });
 
-  it("starts clean when the file does not exist yet", () => {
+  it("starts clean when the file does not exist yet, and writes on first change", () => {
     const fresh = join(dir, "nested", "new-store.json");
     const store = new OAuthStore(fresh, [CLAUDE_REDIRECT]);
     expect(store.countClients()).toBe(0);
-    store.close();
+    // Nothing has changed, so there is nothing to write yet.
+    expect(existsSync(fresh)).toBe(false);
+
+    store.registerClient({ redirect_uris: [CLAUDE_REDIRECT] });
     expect(existsSync(fresh)).toBe(true);
+    store.close();
+    expect(new OAuthStore(fresh, [CLAUDE_REDIRECT]).countClients()).toBe(1);
   });
 });
 

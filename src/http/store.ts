@@ -160,8 +160,16 @@ export class OAuthStore {
     renameSync(tmp, this.dbPath);
   }
 
+  /**
+   * Releases the store.
+   *
+   * Deliberately does NOT write: every mutation has already persisted
+   * synchronously, so a write here would be redundant — and worse, it would
+   * flush the in-memory state over whatever is on disk, silently undoing an
+   * edit made to the file while the process was running.
+   */
   close(): void {
-    this.persist();
+    // Nothing to flush.
   }
 
   /** Drops rows that can no longer be used. Cheap; run at boot. */
