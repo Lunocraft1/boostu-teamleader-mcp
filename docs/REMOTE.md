@@ -197,6 +197,14 @@ systemctl restart teamleader-mcp
 ```bash
 cp deploy/nginx-mcp.conf /etc/nginx/sites-available/teamleader-mcp
 ln -s /etc/nginx/sites-available/teamleader-mcp /etc/nginx/sites-enabled/
+
+# Only needed if no vhost on this host declares default_server. Without it,
+# nginx promotes the alphabetically first block to be the catch-all, which on
+# this host is the MCP vhost — so it would receive all scanner traffic aimed at
+# the bare IP.
+cp deploy/nginx-default-deny.conf /etc/nginx/sites-available/000-default-deny
+ln -s /etc/nginx/sites-available/000-default-deny /etc/nginx/sites-enabled/
+
 nginx -t && systemctl reload nginx
 certbot --nginx -d mcp.von-falken.de
 ```
