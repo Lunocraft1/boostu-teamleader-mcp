@@ -1,29 +1,51 @@
 #!/usr/bin/env node
 /**
- * Prints a scrypt hash for MCP_CONSENT_PASSWORD_HASH.
+ * Prints a scrypt hash for the consent login, and nothing else on stdout.
  *
- *   npm run hash-password -- 'my consent password'
+ *   node dist/http/hashPassword.js            # prompts twice, input hidden
+ *   node dist/http/hashPassword.js 'secret'   # non-interactive (leaves shell history)
+ *   echo 'secret' | node dist/http/hashPassword.js
  *
- * Passing the password as an argument leaves it in the shell history; with no
- * argument the password is read from stdin instead.
+ * Only the hash goes to stdout, so the caller can do:
+ *   HASH="$(node dist/http/hashPassword.js)"
+ * without the password ever leaving this process.
  */
 
-import { hashPassword } from "./password.js";
-
-async function readStdin(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString("utf8").replace(/\r?\n$/, "");
-}
+import { hashPassword, verifyPassword } from "./password.js";
+import { isInteractive, readHiddenTwice, readStdin } from "./prompt.js";
 
 async function main(): Promise<void> {
   const fromArgs = process.argv.slice(2).join(" ");
-  const password = fromArgs || (await readStdin());
+  let password: string;
+
+  if (fromArgs) {
+    process.stderr.write(
+      "Warning: the password was passed as an argument and is now in your shell " +
+        "history and was briefly visible in the process list. Prefer running this " +
+        "with no arguments.\n"
+    );
+    password = fromArgs;
+  } else if (isInteractive()) {
+    password = await readHiddenTwice();
+  } else {
+    password = await readStdin();
+  }
+
   if (!password) {
-    console.error("Usage: npm run hash-password -- '<password>'   (or pipe it on stdin)");
+    process.stderr.write("No password given.\n");
     process.exit(1);
   }
-  console.log(hashPassword(password));
+  const hash = hashPassword(password);
+  // Guard against ever emitting a hash the password does not open.
+  if (!verifyPassword(password, hash)) {
+    process.stderr.write("Internal error: generated hash does not verify.\n");
+    process.exit(1);
+  }
+  // stdout carries the hash only.
+  process.stdout.write(hash + "\n");
 }
 
-void main();
+main().catch((error) => {
+  process.stderr.write(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+});

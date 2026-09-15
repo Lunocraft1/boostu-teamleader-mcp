@@ -24,7 +24,8 @@
     "dev:http": "tsx src/http.ts",
     "start:http": "node dist/http.js",
     "hash-password": "tsx src/http/hashPassword.ts",
-    "user": "tsx src/http/manageUsers.ts"
+    "user": "tsx src/http/manageUsers.ts",
+    "set-password": "tsx src/http/setConsentPassword.ts"
   },
   "keywords": [
     "mcp",

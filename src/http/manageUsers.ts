@@ -7,13 +7,14 @@
  *   npm run user -- passwd <name>
  *   npm run user -- remove <name>
  *
- * Reads MCP_USERS_FILE. Passwords are prompted on stdin, never taken as an
- * argument, so they stay out of the shell history and the process list.
+ * Reads MCP_USERS_FILE. Passwords are prompted with echo disabled and never
+ * taken as an argument, so they stay out of the terminal scrollback, the shell
+ * history and the process list.
  */
 
-import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 import { UserStore } from "./users.js";
+import { readHiddenTwice } from "./prompt.js";
 
 function usage(): never {
   console.error(
@@ -30,23 +31,6 @@ function usage(): never {
     ].join("\n")
   );
   process.exit(1);
-}
-
-async function prompt(question: string): Promise<string> {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    return await new Promise<string>((resolve) => rl.question(question, resolve));
-  } finally {
-    rl.close();
-  }
-}
-
-async function readPasswordTwice(): Promise<string> {
-  const first = await prompt("New password: ");
-  if (!first) throw new Error("Password must not be empty.");
-  const second = await prompt("Repeat password: ");
-  if (first !== second) throw new Error("Passwords do not match.");
-  return first;
 }
 
 async function main(): Promise<void> {
@@ -74,13 +58,13 @@ async function main(): Promise<void> {
     }
     case "add": {
       if (!name) usage();
-      store.addUser(name, await readPasswordTwice());
+      store.addUser(name, await readHiddenTwice());
       console.log(`Added "${name}". Restart the service so it reloads the accounts.`);
       break;
     }
     case "passwd": {
       if (!name) usage();
-      store.setPassword(name, await readPasswordTwice());
+      store.setPassword(name, await readHiddenTwice());
       console.log(`Password changed for "${name}". Restart the service.`);
       break;
     }

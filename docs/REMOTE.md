@@ -174,6 +174,18 @@ MCP_USERS_FILE=/var/lib/teamleader-mcp/users.json npm run user -- add malte
 Adding a second person later is the same command; no code change and no
 redeploy, just a restart so the file is re-read.
 
+To change a password on a running server from a workstation, without the
+password appearing anywhere:
+
+```bash
+npm run set-password            # account "malte"
+npm run set-password -- name    # another account
+```
+
+It prompts with echo disabled, sends only the scrypt hash, restarts the
+service, then reads the stored hash back and checks it against what was typed —
+so a lock-out surfaces there rather than at the next connection attempt.
+
 Then:
 
 ```bash
