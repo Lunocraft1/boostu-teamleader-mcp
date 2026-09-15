@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { canonicalizeResource, loadHttpConfig, type HttpConfig } from "../src/http/config.js";
 import { UserStore } from "../src/http/users.js";
 import { BRIEFING_TOOLS, createBriefingServer } from "../src/http/readOnly.js";
+import { BRIEFING_TOOL_NAMES } from "../src/http/briefingTools.js";
 import { hashPassword, verifyPassword } from "../src/http/password.js";
 import { OAuthStore } from "../src/http/store.js";
 import { LocalOAuthProvider } from "../src/http/provider.js";
@@ -735,7 +736,11 @@ describe("HTTP surface", () => {
     expect(names).toContain("teamleader_users_list");
     expect(names).not.toContain("teamleader_create_event");
     expect(names).not.toContain("teamleader_create_task");
-    for (const name of names) expect(BRIEFING_TOOLS.has(name)).toBe(true);
+    // The purpose-built briefing tools are registered after the filter runs;
+    // they are read-only by construction (only *.list and *.info).
+    expect(names).toContain("teamleader_briefing_agenda");
+    const allowed = new Set<string>([...BRIEFING_TOOLS, ...BRIEFING_TOOL_NAMES]);
+    for (const name of names) expect(allowed.has(name), name).toBe(true);
   });
 
   it("serves write tools on the interactive endpoint", async () => {
@@ -747,6 +752,8 @@ describe("HTTP surface", () => {
     });
     const names: string[] = (await res.json()).result.tools.map((t: { name: string }) => t.name);
     expect(names).toContain("teamleader_create_event");
+    // The briefing tools are useful interactively too.
+    expect(names).toContain("teamleader_briefing_agenda");
     expect(names.length).toBeGreaterThan(BRIEFING_TOOLS.size);
   });
 
