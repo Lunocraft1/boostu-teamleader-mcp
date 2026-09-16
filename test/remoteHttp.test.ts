@@ -25,6 +25,7 @@ import { BRIEFING_TOOL_NAMES } from "../src/http/briefingTools.js";
 import {
   TIME_TRACKING_READ_TOOLS,
   TIME_TRACKING_WRITE_TOOLS,
+  registerTimeTrackingTools,
 } from "../src/http/timeTrackingTools.js";
 import { hashPassword, verifyPassword } from "../src/http/password.js";
 import { OAuthStore } from "../src/http/store.js";
@@ -335,6 +336,58 @@ describe("read-only briefing server", () => {
     expect(skipped).toContain("teamleader_create_task");
     expect(skipped).toContain("teamleader_create_company");
     expect(skipped).toContain("teamleader_update_deal");
+  });
+});
+
+describe("timer_current error translation", () => {
+  it("reports 'no running timer' as a normal result, not a failure", async () => {
+    // Teamleader answers 404 "You have no running timer". Surfacing that as a
+    // tool error would make an ordinary quiet morning look like a broken
+    // integration in the briefing.
+    const calls: string[] = [];
+    const fakeClient = {
+      request: async ({ endpoint }: { endpoint: string }) => {
+        calls.push(endpoint);
+        throw new Error(
+          'Teamleader API error [timers.current]: 404 Not Found - ' +
+            '{"errors":[{"code":0,"title":"You have no running timer","status":404}]}'
+        );
+      },
+    } as unknown as TeamleaderClient;
+
+    const captured: Record<string, (args: unknown) => Promise<unknown>> = {};
+    const fakeServer = {
+      tool: (name: string, ...rest: unknown[]) => {
+        captured[name] = rest[rest.length - 1] as (a: unknown) => Promise<unknown>;
+      },
+    } as unknown as Parameters<typeof registerTimeTrackingTools>[0];
+
+    registerTimeTrackingTools(fakeServer, fakeClient, { includeWrites: false });
+    const result = (await captured["teamleader_timer_current"]({})) as {
+      isError?: boolean;
+      content: { text: string }[];
+    };
+
+    expect(calls).toEqual(["timers.current"]);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual({ running: false });
+  });
+
+  it("still reports a real failure as an error", async () => {
+    const fakeClient = {
+      request: async () => {
+        throw new Error("Teamleader API error [timers.current]: 500 Internal Server Error");
+      },
+    } as unknown as TeamleaderClient;
+    const captured: Record<string, (args: unknown) => Promise<unknown>> = {};
+    const fakeServer = {
+      tool: (name: string, ...rest: unknown[]) => {
+        captured[name] = rest[rest.length - 1] as (a: unknown) => Promise<unknown>;
+      },
+    } as unknown as Parameters<typeof registerTimeTrackingTools>[0];
+    registerTimeTrackingTools(fakeServer, fakeClient, { includeWrites: false });
+    const result = (await captured["teamleader_timer_current"]({})) as { isError?: boolean };
+    expect(result.isError).toBe(true);
   });
 });
 

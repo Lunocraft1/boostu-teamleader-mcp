@@ -170,10 +170,24 @@ export function registerTimeTrackingTools(
 
   server.tool(
     "teamleader_timer_current",
-    "The timer running right now for the authenticated user, if any. Returns no " +
-      "data when nothing is running. Check this before starting another timer.",
+    "The timer running right now for the authenticated user, if any. Check this " +
+      "before starting another timer — only one can run at a time.",
     {},
-    async () => call("timers.current", {})
+    async () => {
+      try {
+        const data = await client.request({ endpoint: "timers.current", body: {} });
+        return text({ running: true, timer: data });
+      } catch (error) {
+        // Teamleader answers 404 "You have no running timer" here. That is a
+        // normal state, not a failure, and reporting it as a tool error makes a
+        // quiet morning look like a broken integration.
+        const message = (error as Error).message ?? String(error);
+        if (/no running timer/i.test(message) || /\b404\b/.test(message)) {
+          return text({ running: false });
+        }
+        return failure(explain("timers.current", error));
+      }
+    }
   );
 
   if (!options.includeWrites) return;
