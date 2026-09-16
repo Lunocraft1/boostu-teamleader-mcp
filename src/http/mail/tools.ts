@@ -24,6 +24,7 @@ import {
   checkHealth,
   describeFailure,
   resolveSince,
+  withConnection,
   withMailbox,
   type MailConfig,
 } from "./imap.js";
@@ -196,9 +197,14 @@ function messageIds(value?: string): string[] {
  *
  * Used to keep a second briefing run from producing a second draft for the
  * same mail — the failure mode the brief calls out explicitly.
+ *
+ * Runs on an existing connection and fetches envelopes only: In-Reply-To is
+ * part of the envelope, so the much larger header block is not needed. Doing
+ * this on its own connection per folder cost three TCP/TLS handshakes and was
+ * a measurable part of a listing that timed out.
  */
 async function referencedElsewhere(
-  config: MailConfig,
+  client: ImapFlow,
   since: Date
 ): Promise<{ drafted: Set<string>; replied: Set<string> }> {
   const drafted = new Set<string>();
@@ -206,23 +212,17 @@ async function referencedElsewhere(
 
   const scan = async (path: string, into: Set<string>): Promise<void> => {
     try {
-      await withMailbox(config, path, async (client) => {
-        const uids = (await client.search({ since }, { uid: true })) || [];
-        if (!uids.length) return;
-        for await (const msg of client.fetch(
-          { uid: uids.join(",") },
-          { uid: true, envelope: true, headers: WANTED_HEADERS },
-          { uid: true }
-        )) {
-          const headers = parseHeaders(msg.headers);
-          for (const id of messageIds(headerValue(headers, "in-reply-to"))) into.add(id);
-          for (const id of messageIds(headerValue(headers, "references"))) into.add(id);
-          if (msg.envelope?.inReplyTo) {
-            for (const id of messageIds(`<${msg.envelope.inReplyTo}>`)) into.add(id);
-            into.add(msg.envelope.inReplyTo.replace(/[<>]/g, ""));
-          }
-        }
-      });
+      await client.mailboxOpen(path, { readOnly: true });
+      const uids = (await client.search({ since }, { uid: true })) || [];
+      if (!uids.length) return;
+      for await (const msg of client.fetch(
+        { uid: uids.join(",") },
+        { uid: true, envelope: true },
+        { uid: true }
+      )) {
+        const parent = msg.envelope?.inReplyTo;
+        if (parent) into.add(parent.replace(/[<>]/g, ""));
+      }
     } catch {
       // A missing or unreadable Drafts/Sent folder must not fail the listing;
       // the flags simply stay unknown.
@@ -232,6 +232,47 @@ async function referencedElsewhere(
   await scan(MAILBOX.drafts, drafted);
   await scan(MAILBOX.sent, replied);
   return { drafted, replied };
+}
+
+/**
+ * Fetches the readable body part for many messages in as few commands as
+ * possible.
+ *
+ * Downloading per message cost one IMAP round trip each, which made a listing
+ * of 25 messages exceed the request timeout. Messages are instead grouped by
+ * the part number their text lives in — in practice two or three distinct
+ * values across a whole inbox — and each group is fetched in one command.
+ */
+async function fetchBodiesBatched(
+  client: ImapFlow,
+  targets: { uid: number; part: string; type: string }[],
+  maxBytes: number
+): Promise<Map<number, { plain?: string; html?: string }>> {
+  const result = new Map<number, { plain?: string; html?: string }>();
+  const byPart = new Map<string, { uids: number[]; type: string }>();
+  for (const t of targets) {
+    const entry = byPart.get(t.part) ?? { uids: [], type: t.type };
+    entry.uids.push(t.uid);
+    byPart.set(t.part, entry);
+  }
+
+  for (const [part, { uids, type }] of byPart) {
+    try {
+      for await (const msg of client.fetch(
+        { uid: uids.join(",") },
+        { uid: true, bodyParts: [part] },
+        { uid: true }
+      )) {
+        const raw = msg.bodyParts?.get(part);
+        if (!raw) continue;
+        const body = raw.subarray(0, maxBytes).toString("utf8");
+        result.set(msg.uid, type === "text/html" ? { html: body } : { plain: body });
+      }
+    } catch {
+      // Leave the preview empty for this group rather than failing the listing.
+    }
+  }
+  return result;
 }
 
 async function downloadText(
@@ -310,9 +351,13 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
         const limit = p.limit ?? 40;
         const previewChars = p.preview_chars ?? 300;
 
-        const { drafted, replied } = await referencedElsewhere(config, since);
+        // One connection for all three mailboxes. Opening a connection per
+        // folder cost three TLS handshakes and helped push an earlier version
+        // past the request timeout.
+        return await withConnection(config, async (client) => {
+          const { drafted, replied } = await referencedElsewhere(client, since);
 
-        return await withMailbox(config, MAILBOX.inbox, async (client) => {
+          await client.mailboxOpen(MAILBOX.inbox, { readOnly: true });
           // IMAP SINCE has date granularity, so the exact cut-off is applied
           // again below on the real timestamp.
           const criteria = p.only_unread ? { since, seen: false } : { since };
@@ -328,11 +373,20 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
             };
           }
 
-          const rows: Record<string, unknown>[] = [];
+          // Newest first, and only as many as asked for — the metadata pass is
+          // cheap but the body pass is not.
           const newestFirst = [...uids].sort((a, b) => b - a);
+          const selected = newestFirst.slice(0, Math.min(limit * 2, newestFirst.length));
+
+          interface Row {
+            row: Record<string, unknown>;
+            at?: Date;
+            part?: { uid: number; part: string; type: string };
+          }
+          const collected: Row[] = [];
 
           for await (const msg of client.fetch(
-            { uid: newestFirst.join(",") },
+            { uid: selected.join(",") },
             {
               uid: true,
               envelope: true,
@@ -365,7 +419,7 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
               uid: msg.uid,
               von: addr(msg.envelope?.from),
               betreff: msg.envelope?.subject ?? "(kein Betreff)",
-              datum: at?.toISOString(),
+              datum: toIso(when),
               ungelesen: !flags.has("\\Seen"),
               beantwortet: flags.has("\\Answered") || (messageId ? replied.has(messageId) : false),
               entwurf_vorhanden: messageId ? drafted.has(messageId) : false,
@@ -379,24 +433,41 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
             }
             if (msg.envelope?.inReplyTo) row.ist_antwort_auf = msg.envelope.inReplyTo;
 
-            if (previewChars > 0) {
-              const body = await downloadText(client, msg.uid, msg.bodyStructure, 64 * 1024);
-              const extract = extractBody(body.plain, body.html, previewChars);
-              row.vorschau = extract.text;
-              if (extract.truncated) row.vorschau_gekuerzt = true;
-            }
+            const target = findTextPart(msg.bodyStructure);
+            collected.push({
+              row,
+              at,
+              part: target ? { uid: msg.uid, part: target.part, type: target.type } : undefined,
+            });
+            if (collected.length >= limit) break;
+          }
 
-            rows.push(row);
-            if (rows.length >= limit) break;
+          collected.sort((a, b) => (b.at?.getTime() ?? 0) - (a.at?.getTime() ?? 0));
+
+          if (previewChars > 0 && collected.length) {
+            const bodies = await fetchBodiesBatched(
+              client,
+              collected.map((c) => c.part).filter((t): t is NonNullable<typeof t> => Boolean(t)),
+              64 * 1024
+            );
+            for (const entry of collected) {
+              const body = bodies.get(entry.row.uid as number);
+              if (!body) continue;
+              const extract = extractBody(body.plain, body.html, previewChars);
+              entry.row.vorschau = extract.text;
+              if (extract.truncated) entry.row.vorschau_gekuerzt = true;
+            }
           }
 
           return {
             status: "ok" as const,
             since: since.toISOString(),
             clamped,
-            count: rows.length,
-            ...(uids.length > rows.length ? { weitere_vorhanden: uids.length - rows.length } : {}),
-            messages: rows,
+            count: collected.length,
+            ...(uids.length > collected.length
+              ? { weitere_vorhanden: uids.length - collected.length }
+              : {}),
+            messages: collected.map((c) => c.row),
           };
         });
       })
