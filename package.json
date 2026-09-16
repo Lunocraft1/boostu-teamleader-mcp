@@ -61,7 +61,9 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
     "html-to-text": "^10.0.1",
+    "iconv-lite": "^0.7.3",
     "imapflow": "^2.0.5",
+    "libqp": "^2.1.1",
     "mailparser": "^3.9.28",
     "zod": "^3.25.76"
   },

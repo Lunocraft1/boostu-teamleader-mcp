@@ -29,6 +29,7 @@ import {
   type MailConfig,
 } from "./imap.js";
 import { extractBody, isAutomated } from "./text.js";
+import { decodeBodyPart } from "./decode.js";
 
 export const MAIL_READ_TOOLS = [
   "mail_health",
@@ -93,18 +94,32 @@ function firstAddress(list?: { name?: string; address?: string }[]): string {
   return list?.[0]?.address ?? "";
 }
 
+interface TextPart {
+  part: string;
+  type: string;
+  /** Content-Transfer-Encoding, needed to decode a batched bodyParts fetch. */
+  encoding?: string;
+  charset?: string;
+}
+
 /** Walks the MIME tree for the part best suited to reading. */
-function findTextPart(node?: MessageStructureObject): { part: string; type: string } | undefined {
+function findTextPart(node?: MessageStructureObject): TextPart | undefined {
   if (!node) return undefined;
-  const preferred: { part: string; type: string }[] = [];
-  const fallback: { part: string; type: string }[] = [];
+  const preferred: TextPart[] = [];
+  const fallback: TextPart[] = [];
 
   const walk = (n: MessageStructureObject): void => {
     const type = (n.type ?? "").toLowerCase();
     const isAttachment = (n.disposition ?? "").toLowerCase() === "attachment";
     if (!isAttachment && n.part) {
-      if (type === "text/plain") preferred.push({ part: n.part, type });
-      else if (type === "text/html") fallback.push({ part: n.part, type });
+      const entry: TextPart = {
+        part: n.part,
+        type,
+        encoding: n.encoding,
+        charset: n.parameters?.charset,
+      };
+      if (type === "text/plain") preferred.push(entry);
+      else if (type === "text/html") fallback.push(entry);
     }
     for (const child of n.childNodes ?? []) walk(child);
   };
@@ -113,7 +128,9 @@ function findTextPart(node?: MessageStructureObject): { part: string; type: stri
   // A single-part message has no part number; "1" addresses its only body.
   if (!preferred.length && !fallback.length) {
     const type = (node.type ?? "").toLowerCase();
-    if (type.startsWith("text/")) return { part: "1", type };
+    if (type.startsWith("text/")) {
+      return { part: "1", type, encoding: node.encoding, charset: node.parameters?.charset };
+    }
     return undefined;
   }
   return preferred[0] ?? fallback[0];
@@ -245,28 +262,36 @@ async function referencedElsewhere(
  */
 async function fetchBodiesBatched(
   client: ImapFlow,
-  targets: { uid: number; part: string; type: string }[],
+  targets: (TextPart & { uid: number })[],
   maxBytes: number
 ): Promise<Map<number, { plain?: string; html?: string }>> {
   const result = new Map<number, { plain?: string; html?: string }>();
-  const byPart = new Map<string, { uids: number[]; type: string }>();
+
+  // Grouped by part number *and* encoding, because the decode step differs and
+  // a bodyParts fetch returns the part still in its transfer encoding.
+  const groups = new Map<string, { target: TextPart; uids: number[] }>();
   for (const t of targets) {
-    const entry = byPart.get(t.part) ?? { uids: [], type: t.type };
+    const key = `${t.part}|${t.encoding ?? ""}|${t.charset ?? ""}|${t.type}`;
+    const entry = groups.get(key) ?? { target: t, uids: [] };
     entry.uids.push(t.uid);
-    byPart.set(t.part, entry);
+    groups.set(key, entry);
   }
 
-  for (const [part, { uids, type }] of byPart) {
+  for (const { target, uids } of groups.values()) {
     try {
       for await (const msg of client.fetch(
         { uid: uids.join(",") },
-        { uid: true, bodyParts: [part] },
+        { uid: true, bodyParts: [target.part] },
         { uid: true }
       )) {
-        const raw = msg.bodyParts?.get(part);
+        const raw = msg.bodyParts?.get(target.part);
         if (!raw) continue;
-        const body = raw.subarray(0, maxBytes).toString("utf8");
-        result.set(msg.uid, type === "text/html" ? { html: body } : { plain: body });
+        const body = decodeBodyPart(
+          raw.subarray(0, maxBytes),
+          target.encoding,
+          target.charset
+        );
+        result.set(msg.uid, target.type === "text/html" ? { html: body } : { plain: body });
       }
     } catch {
       // Leave the preview empty for this group rather than failing the listing.
@@ -381,7 +406,7 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
           interface Row {
             row: Record<string, unknown>;
             at?: Date;
-            part?: { uid: number; part: string; type: string };
+            part?: TextPart & { uid: number };
           }
           const collected: Row[] = [];
 
@@ -437,7 +462,7 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
             collected.push({
               row,
               at,
-              part: target ? { uid: msg.uid, part: target.part, type: target.type } : undefined,
+              part: target ? { ...target, uid: msg.uid } : undefined,
             });
             if (collected.length >= limit) break;
           }
