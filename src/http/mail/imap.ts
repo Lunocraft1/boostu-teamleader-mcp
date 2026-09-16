@@ -24,6 +24,8 @@ export interface MailConfig {
   password: string;
   /** Hard cap on how far back a query may look, in days. */
   maxLookbackDays: number;
+  /** Sign-off appended under the closing of a generated draft. */
+  draftSignature?: string;
 }
 
 export type MailFailureReason =
@@ -77,7 +79,14 @@ export function loadMailConfig(env: NodeJS.ProcessEnv = process.env): MailConfig
   if (!Number.isInteger(maxLookbackDays) || maxLookbackDays <= 0) {
     throw new Error("MAIL_MAX_LOOKBACK_DAYS must be a positive integer.");
   }
-  return { host, port, user, password, maxLookbackDays };
+  return {
+    host,
+    port,
+    user,
+    password,
+    maxLookbackDays,
+    draftSignature: env.MAIL_DRAFT_SIGNATURE?.trim() || undefined,
+  };
 }
 
 function classify(error: unknown): MailUnavailableError {

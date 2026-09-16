@@ -30,6 +30,15 @@ import {
 } from "./imap.js";
 import { extractBody, isAutomated } from "./text.js";
 import { decodeBodyPart } from "./decode.js";
+import {
+  buildDraftMime,
+  buildReferences,
+  closingFor,
+  firstNameOf,
+  greetingFor,
+  replySubject,
+  type DraftStyle,
+} from "./draft.js";
 
 export const MAIL_READ_TOOLS = [
   "mail_health",
@@ -38,6 +47,12 @@ export const MAIL_READ_TOOLS = [
   "mail_message",
   "mail_thread_previous",
 ] as const;
+
+/**
+ * The only mail tool that writes. It is also the only write tool the briefing
+ * endpoint carries at all.
+ */
+export const MAIL_WRITE_TOOLS = ["mail_draft_reply"] as const;
 
 const MAILBOX = {
   inbox: "INBOX",
@@ -630,6 +645,157 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
   );
 
   // ── Thread context ────────────────────────────────────────────────────────
+
+  // ── Draft (the single write) ──────────────────────────────────────────────
+
+  server.tool(
+    "mail_draft_reply",
+    "Writes a reply into the Drafts folder of the mailbox. Does NOT send: no " +
+      "outgoing mail server is configured and no code path to send exists. " +
+      "Recipients, subject and thread references are taken from the original " +
+      "message, not chosen freely. Supply only the substance of the reply — " +
+      "salutation and closing are added according to `style`. Refuses for " +
+      "automated senders and for messages that are already answered or already " +
+      "have a draft, so a second briefing run cannot produce a second draft.",
+    {
+      uid: z.number().int().positive().describe("UID of the message to reply to, from mail_inbox_since"),
+      body: z
+        .string()
+        .min(1)
+        .describe("The reply itself, without greeting or sign-off — those are added"),
+      style: z
+        .enum(["sachlich", "persoenlich", "foermlich"])
+        .optional()
+        .describe("Register of the salutation and closing (default: sachlich)"),
+      include_cc: z
+        .boolean()
+        .optional()
+        .describe("Also address everyone who was in Cc (default false: sender only)"),
+      force: z
+        .boolean()
+        .optional()
+        .describe(
+          "Write even though the mail is answered, already has a draft, or is automated. " +
+            "Only for an explicit request for another draft; the existing one is kept."
+        ),
+    },
+    async (p) =>
+      guard(async () => {
+        const style: DraftStyle = p.style ?? "sachlich";
+
+        return await withConnection(config, async (client) => {
+          const { drafted, replied } = await referencedElsewhere(
+            client,
+            new Date(Date.now() - config.maxLookbackDays * 86_400_000)
+          );
+
+          await client.mailboxOpen(MAILBOX.inbox, { readOnly: true });
+          const found = await client.fetchAll(
+            { uid: String(p.uid) },
+            { uid: true, envelope: true, flags: true, headers: WANTED_HEADERS },
+            { uid: true }
+          );
+          const original = found?.[0];
+          if (!original) {
+            return { status: "not_found" as const, uid: p.uid };
+          }
+
+          const headers = parseHeaders(original.headers);
+          const messageId = (
+            original.envelope?.messageId ?? headerValue(headers, "message-id") ?? ""
+          ).replace(/[<>]/g, "");
+          if (!messageId) {
+            return {
+              status: "abgelehnt" as const,
+              grund:
+                "Die Nachricht hat keine Message-ID. Ein Entwurf könnte nicht am Verlauf " +
+                "hängen und läge als loser Entwurf herum.",
+            };
+          }
+
+          // Guard 1: automated senders never get a draft. They do not read
+          // replies, and a reply to a no-reply address bounces.
+          const auto = isAutomated({
+            from: firstAddress(original.envelope?.from),
+            subject: original.envelope?.subject,
+            listUnsubscribe: Boolean(headerValue(headers, "list-unsubscribe")),
+            autoSubmitted: headerValue(headers, "auto-submitted"),
+            precedence: headerValue(headers, "precedence"),
+          });
+          if (auto.automated && !p.force) {
+            return {
+              status: "uebersprungen" as const,
+              grund: `Automatischer Absender (${auto.reason}). Kein Entwurf erzeugt.`,
+              hinweis: "Mit force=true trotzdem möglich, ist hier aber selten sinnvoll.",
+            };
+          }
+
+          // Guard 2: never a second draft for the same mail.
+          const flags = original.flags ?? new Set<string>();
+          const alreadyAnswered = flags.has("\\Answered") || replied.has(messageId);
+          const alreadyDrafted = drafted.has(messageId);
+          if ((alreadyAnswered || alreadyDrafted) && !p.force) {
+            return {
+              status: "uebersprungen" as const,
+              grund: alreadyDrafted
+                ? "Für diese Nachricht liegt bereits ein Entwurf im Ordner."
+                : "Diese Nachricht ist bereits beantwortet.",
+              hinweis: "Mit force=true wird ein zusätzlicher Entwurf erzeugt; der alte bleibt.",
+            };
+          }
+
+          // Recipients come from the original. Reply-To wins over From when the
+          // sender asked for answers to go elsewhere.
+          const replyTo = original.envelope?.replyTo?.length
+            ? original.envelope.replyTo
+            : original.envelope?.from;
+          const to = addr(replyTo);
+          if (!to) {
+            return {
+              status: "abgelehnt" as const,
+              grund: "Kein auswertbarer Absender, also keine Empfängeradresse für die Antwort.",
+            };
+          }
+
+          const mime = await buildDraftMime({
+            from: config.user,
+            to,
+            cc: p.include_cc ? addr(original.envelope?.cc) || undefined : undefined,
+            subject: replySubject(original.envelope?.subject),
+            inReplyTo: `<${messageId}>`,
+            references: buildReferences(messageId, headerValue(headers, "references")),
+            greeting: greetingFor(style, firstNameOf(replyTo?.[0]?.name)),
+            body: p.body,
+            closing: closingFor(style),
+            signature: config.draftSignature,
+          });
+
+          // \Draft marks it as a draft; \Seen keeps it from showing up as an
+          // unread message in the user's own mailbox.
+          const appended = await client.append(MAILBOX.drafts, mime, ["\\Draft", "\\Seen"]);
+          if (!appended) {
+            return {
+              status: "fehlgeschlagen" as const,
+              grund: "Der Entwürfe-Ordner hat die Nachricht nicht angenommen.",
+            };
+          }
+
+          return {
+            status: "ok" as const,
+            ordner: MAILBOX.drafts,
+            an: to,
+            betreff: replySubject(original.envelope?.subject),
+            haengt_am_verlauf: true,
+            bytes: mime.length,
+            stil: style,
+            ...(p.force && (alreadyAnswered || alreadyDrafted)
+              ? { warnung: "force war gesetzt — es gibt jetzt einen weiteren Entwurf." }
+              : {}),
+            hinweis: "Entwurf liegt in Proton. Nicht gesendet — Versand ist nicht eingerichtet.",
+          };
+        });
+      })
+  );
 
   server.tool(
     "mail_thread_previous",
