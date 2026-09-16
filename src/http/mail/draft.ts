@@ -45,6 +45,30 @@ export function closingFor(style: DraftStyle): string {
 /** Subject prefixes that already mark a reply, German and English. */
 const REPLY_PREFIX = /^\s*(re|aw|antw|antwort|fw|fwd|wg)\s*:/i;
 
+/**
+ * Identity of a reply, for recognising one that already exists.
+ *
+ * Header-based matching is not available: Proton strips In-Reply-To, References
+ * and every custom header from a draft appended over IMAP and substitutes its
+ * own internal ids (verified against the live mailbox). What survives is the
+ * recipient and the subject, so those identify the reply — which is also the
+ * right semantics: if a draft to the same person about the same subject is
+ * already waiting, a second one is noise.
+ */
+export function replyKey(toAddress: string, subject: string): string {
+  const address = toAddress.toLowerCase().trim();
+  let base = subject.replace(/\s+/g, " ").trim();
+  // Strip any number of stacked reply prefixes so "Re: AW: X" matches "X".
+  while (REPLY_PREFIX.test(base)) base = base.replace(REPLY_PREFIX, "").trim();
+  return `${address}|${base.toLowerCase()}`;
+}
+
+/** Bare email address out of a "Name <addr>" string. */
+export function bareAddress(value: string): string {
+  const match = /<([^>]+)>/.exec(value);
+  return (match ? match[1] : value).trim().toLowerCase();
+}
+
 /** Adds "Re: " unless the subject already carries a reply prefix. */
 export function replySubject(original?: string): string {
   const subject = (original ?? "").replace(/\s+/g, " ").trim();

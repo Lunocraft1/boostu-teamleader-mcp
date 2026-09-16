@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { decodeBodyPart } from "../src/http/mail/decode.js";
 import {
+  bareAddress,
   buildDraftMime,
   buildReferences,
   closingFor,
   composeText,
   firstNameOf,
   greetingFor,
+  replyKey,
   replySubject,
 } from "../src/http/mail/draft.js";
 
@@ -199,5 +201,41 @@ describe("buildDraftMime", () => {
       })
     ).toString("utf8");
     expect(without).not.toMatch(/^Cc:/m);
+  });
+});
+
+describe("replyKey", () => {
+  it("identifies the same reply regardless of the prefix used", () => {
+    // Proton strips In-Reply-To from an appended draft, so recipient plus
+    // subject is the only identity left to recognise an existing draft by.
+    const a = replyKey("patrick@carrier.com", "BV. Gemünder beiblatt");
+    expect(replyKey("patrick@carrier.com", "Re: BV. Gemünder beiblatt")).toBe(a);
+    expect(replyKey("patrick@carrier.com", "AW: BV. Gemünder beiblatt")).toBe(a);
+    // Stacked prefixes, which is what happens after a few round trips.
+    expect(replyKey("patrick@carrier.com", "Re: AW: BV. Gemünder beiblatt")).toBe(a);
+  });
+
+  it("is case- and whitespace-insensitive", () => {
+    expect(replyKey("Patrick@Carrier.COM", "  Angebot   ECM ")).toBe(
+      replyKey("patrick@carrier.com", "Angebot ECM")
+    );
+  });
+
+  it("separates different recipients and different subjects", () => {
+    const base = replyKey("a@x.de", "Angebot");
+    expect(replyKey("b@x.de", "Angebot")).not.toBe(base);
+    expect(replyKey("a@x.de", "Rechnung")).not.toBe(base);
+  });
+});
+
+describe("bareAddress", () => {
+  it("extracts the address from a display-name form", () => {
+    expect(bareAddress('"Hofmann, Patrick" <Patrick.Hofmann1@carrier.com>')).toBe(
+      "patrick.hofmann1@carrier.com"
+    );
+  });
+
+  it("passes a plain address through", () => {
+    expect(bareAddress("angebote@viessmann.de")).toBe("angebote@viessmann.de");
   });
 });

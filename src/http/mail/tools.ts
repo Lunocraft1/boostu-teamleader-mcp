@@ -31,11 +31,13 @@ import {
 import { extractBody, isAutomated } from "./text.js";
 import { decodeBodyPart } from "./decode.js";
 import {
+  bareAddress,
   buildDraftMime,
   buildReferences,
   closingFor,
   firstNameOf,
   greetingFor,
+  replyKey,
   replySubject,
   type DraftStyle,
 } from "./draft.js";
@@ -238,11 +240,18 @@ function messageIds(value?: string): string[] {
 async function referencedElsewhere(
   client: ImapFlow,
   since: Date
-): Promise<{ drafted: Set<string>; replied: Set<string> }> {
+): Promise<{
+  drafted: Set<string>;
+  replied: Set<string>;
+  draftKeys: Set<string>;
+  repliedKeys: Set<string>;
+}> {
   const drafted = new Set<string>();
   const replied = new Set<string>();
+  const draftKeys = new Set<string>();
+  const repliedKeys = new Set<string>();
 
-  const scan = async (path: string, into: Set<string>): Promise<void> => {
+  const scan = async (path: string, ids: Set<string>, keys: Set<string>): Promise<void> => {
     try {
       await client.mailboxOpen(path, { readOnly: true });
       const uids = (await client.search({ since }, { uid: true })) || [];
@@ -252,8 +261,14 @@ async function referencedElsewhere(
         { uid: true, envelope: true },
         { uid: true }
       )) {
+        // In-Reply-To survives on messages Proton itself created (a reply sent
+        // from the Proton UI), so it is still worth reading where present.
         const parent = msg.envelope?.inReplyTo;
-        if (parent) into.add(parent.replace(/[<>]/g, ""));
+        if (parent) ids.add(parent.replace(/[<>]/g, ""));
+        // Recipient + subject is the only identity that survives an IMAP
+        // APPEND into Proton; see replyKey.
+        const to = msg.envelope?.to?.[0]?.address;
+        if (to) keys.add(replyKey(to, msg.envelope?.subject ?? ""));
       }
     } catch {
       // A missing or unreadable Drafts/Sent folder must not fail the listing;
@@ -261,9 +276,9 @@ async function referencedElsewhere(
     }
   };
 
-  await scan(MAILBOX.drafts, drafted);
-  await scan(MAILBOX.sent, replied);
-  return { drafted, replied };
+  await scan(MAILBOX.drafts, drafted, draftKeys);
+  await scan(MAILBOX.sent, replied, repliedKeys);
+  return { drafted, replied, draftKeys, repliedKeys };
 }
 
 /**
@@ -395,7 +410,7 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
         // folder cost three TLS handshakes and helped push an earlier version
         // past the request timeout.
         return await withConnection(config, async (client) => {
-          const { drafted, replied } = await referencedElsewhere(client, since);
+          const scan = await referencedElsewhere(client, since);
 
           await client.mailboxOpen(MAILBOX.inbox, { readOnly: true });
           // IMAP SINCE has date granularity, so the exact cut-off is applied
@@ -461,8 +476,23 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
               betreff: msg.envelope?.subject ?? "(kein Betreff)",
               datum: toIso(when),
               ungelesen: !flags.has("\\Seen"),
-              beantwortet: flags.has("\\Answered") || (messageId ? replied.has(messageId) : false),
-              entwurf_vorhanden: messageId ? drafted.has(messageId) : false,
+              beantwortet:
+                flags.has("\\Answered") ||
+                (messageId ? scan.replied.has(messageId) : false) ||
+                scan.repliedKeys.has(
+                  replyKey(
+                    firstAddress(msg.envelope?.replyTo) || firstAddress(msg.envelope?.from),
+                    msg.envelope?.subject ?? ""
+                  )
+                ),
+              entwurf_vorhanden:
+                (messageId ? scan.drafted.has(messageId) : false) ||
+                scan.draftKeys.has(
+                  replyKey(
+                    firstAddress(msg.envelope?.replyTo) || firstAddress(msg.envelope?.from),
+                    msg.envelope?.subject ?? ""
+                  )
+                ),
               automatisch: auto.automated,
               bytes: msg.size,
             };
@@ -684,7 +714,7 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
         const style: DraftStyle = p.style ?? "sachlich";
 
         return await withConnection(config, async (client) => {
-          const { drafted, replied } = await referencedElsewhere(
+          const scan = await referencedElsewhere(
             client,
             new Date(Date.now() - config.maxLookbackDays * 86_400_000)
           );
@@ -732,8 +762,16 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
 
           // Guard 2: never a second draft for the same mail.
           const flags = original.flags ?? new Set<string>();
-          const alreadyAnswered = flags.has("\\Answered") || replied.has(messageId);
-          const alreadyDrafted = drafted.has(messageId);
+          const replyToList = original.envelope?.replyTo?.length
+            ? original.envelope.replyTo
+            : original.envelope?.from;
+          const key = replyKey(
+            bareAddress(addr(replyToList)),
+            original.envelope?.subject ?? ""
+          );
+          const alreadyAnswered =
+            flags.has("\\Answered") || scan.replied.has(messageId) || scan.repliedKeys.has(key);
+          const alreadyDrafted = scan.drafted.has(messageId) || scan.draftKeys.has(key);
           if ((alreadyAnswered || alreadyDrafted) && !p.force) {
             return {
               status: "uebersprungen" as const,
@@ -746,9 +784,7 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
 
           // Recipients come from the original. Reply-To wins over From when the
           // sender asked for answers to go elsewhere.
-          const replyTo = original.envelope?.replyTo?.length
-            ? original.envelope.replyTo
-            : original.envelope?.from;
+          const replyTo = replyToList;
           const to = addr(replyTo);
           if (!to) {
             return {
@@ -785,7 +821,16 @@ export function registerMailTools(server: McpServer, config: MailConfig | undefi
             ordner: MAILBOX.drafts,
             an: to,
             betreff: replySubject(original.envelope?.subject),
-            haengt_am_verlauf: true,
+            // Proton strips In-Reply-To and References from a draft appended
+            // over IMAP and substitutes its own internal ids, so the draft does
+            // not nest under the original conversation. Verified against the
+            // live mailbox. Claiming otherwise here would be a lie the user
+            // only discovers when looking for the draft.
+            haengt_am_verlauf: false,
+            verlauf_hinweis:
+              "Proton entfernt beim Anhängen über IMAP den Verlaufsbezug. Der Entwurf " +
+              "liegt als eigenständiger Entwurf im Ordner, mit korrektem Empfänger und " +
+              "Re-Betreff.",
             bytes: mime.length,
             stil: style,
             ...(p.force && (alreadyAnswered || alreadyDrafted)
