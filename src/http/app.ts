@@ -36,6 +36,8 @@ import { requestLogger } from "./logging.js";
 import { createBriefingServer, createWorkServer } from "./readOnly.js";
 import { registerBriefingTools } from "./briefingTools.js";
 import { registerTimeTrackingTools } from "./timeTrackingTools.js";
+import { registerMailTools } from "./mail/tools.js";
+import type { MailConfig } from "./mail/imap.js";
 import type { OAuthStore } from "./store.js";
 import type { UserStore } from "./users.js";
 
@@ -209,9 +211,11 @@ export interface AppDeps {
   store: OAuthStore;
   users: UserStore;
   client: TeamleaderClient;
+  /** Absent when the mailbox is not configured; the mail tools then stay off. */
+  mail?: MailConfig;
 }
 
-export function createApp({ config, store, users, client }: AppDeps): Express {
+export function createApp({ config, store, users, client, mail }: AppDeps): Express {
   const app = express();
   // nginx terminates TLS; without this the rate limiters would key every
   // request to the proxy's address and req.ip would be useless in the log.
@@ -232,6 +236,7 @@ export function createApp({ config, store, users, client }: AppDeps): Express {
         readOnly: endpoint.readOnly,
       })),
       accounts: users.count(),
+      mailConfigured: Boolean(mail),
       registeredClients: store.countClients(),
       uptimeSeconds: Math.round(process.uptime()),
     });
@@ -268,6 +273,9 @@ export function createApp({ config, store, users, client }: AppDeps): Express {
       registerBriefingTools(server, client);
       // Time tracking: reads everywhere, writes only on the interactive endpoint.
       registerTimeTrackingTools(server, client, { includeWrites: !endpoint.readOnly });
+      // Mail: read-only on both endpoints. The draft tool comes separately and
+      // is the single exception to the briefing endpoint being read-only.
+      registerMailTools(server, mail);
       return server;
     };
 
