@@ -28,14 +28,14 @@ import { revocationHandler } from "@modelcontextprotocol/sdk/server/auth/handler
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { TeamleaderClient } from "../api/client.js";
-import { createServer } from "../server.js";
 import { canonicalizeResource, type HttpConfig, type McpEndpointConfig } from "./config.js";
 import { metadataRouter, resourceMetadataUrl } from "./metadata.js";
 import { consentRouter } from "./consent.js";
 import { LocalOAuthProvider } from "./provider.js";
 import { requestLogger } from "./logging.js";
-import { createBriefingServer } from "./readOnly.js";
+import { createBriefingServer, createWorkServer } from "./readOnly.js";
 import { registerBriefingTools } from "./briefingTools.js";
+import { registerTimeTrackingTools } from "./timeTrackingTools.js";
 import type { OAuthStore } from "./store.js";
 import type { UserStore } from "./users.js";
 
@@ -259,11 +259,15 @@ export function createApp({ config, store, users, client }: AppDeps): Express {
   // ── MCP endpoints ─────────────────────────────────────────────────────────
   for (const endpoint of config.endpoints) {
     const buildServer = (): McpServer => {
-      const server = endpoint.readOnly ? createBriefingServer(client).server : createServer(client);
+      const server = endpoint.readOnly
+        ? createBriefingServer(client).server
+        : createWorkServer(client).server;
       // Added after createServer, so they are outside the read-only filter's
       // reach — safe, because they only call *.list and *.info. Available on
       // both endpoints: the interactive one benefits from them too.
       registerBriefingTools(server, client);
+      // Time tracking: reads everywhere, writes only on the interactive endpoint.
+      registerTimeTrackingTools(server, client, { includeWrites: !endpoint.readOnly });
       return server;
     };
 

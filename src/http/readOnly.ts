@@ -51,10 +51,40 @@ export const BRIEFING_TOOLS: ReadonlySet<string> = new Set([
   "teamleader_get_deal",
 ]);
 
+/**
+ * Upstream's own time tracking tools.
+ *
+ * They are suppressed everywhere in favour of src/http/timeTrackingTools.ts,
+ * which follows the documented API where upstream does not. Filtering by name
+ * rather than by group is deliberate: `TEAMLEADER_TOOLS` being unset enables
+ * every upstream group, so a configuration check would miss the default case
+ * and the duplicate registration would only surface as a 500 on tools/list.
+ */
+export const UPSTREAM_TIME_TRACKING_TOOLS: ReadonlySet<string> = new Set([
+  "teamleader_time_tracking_list",
+  "teamleader_time_tracking_add",
+  "teamleader_time_tracking_update",
+  "teamleader_timer_start",
+  "teamleader_timer_stop",
+]);
+
 export interface FilteredServer {
   server: McpServer;
   registered: string[];
   skipped: string[];
+}
+
+export interface FilterOptions {
+  /** When set, only these tool names are registered. */
+  allow?: ReadonlySet<string>;
+  /** Tool names to suppress. Applied after `allow`. */
+  deny?: ReadonlySet<string>;
+  /**
+   * Require that the filter actually suppressed something. Guards against an
+   * upstream change routing registrations past the wrapped methods, which would
+   * otherwise silently serve tools that were meant to be excluded.
+   */
+  expectSkips?: boolean;
 }
 
 /** Stand-in for the RegisteredTool handle of a tool we did not register. */
@@ -75,7 +105,19 @@ const NOT_REGISTERED = {
  * duration of the (synchronous, single-threaded) call, which means the filter
  * sits on the same entry point the upstream registrars actually use.
  */
-export function createBriefingServer(client: TeamleaderClient): FilteredServer {
+/**
+ * Builds an McpServer with a filtered tool set.
+ *
+ * `createServer` constructs its own McpServer and does not return the tool
+ * handles, so there is nothing to remove afterwards without reaching into SDK
+ * internals. Instead the public registration methods are wrapped for the
+ * duration of the (synchronous, single-threaded) call, which means the filter
+ * sits on the same entry point the upstream registrars actually use.
+ */
+export function createFilteredServer(
+  client: TeamleaderClient,
+  options: FilterOptions
+): FilteredServer {
   const proto = McpServer.prototype as unknown as Record<string, unknown>;
   const originalTool = proto.tool;
   const originalRegisterTool = proto.registerTool;
@@ -83,9 +125,15 @@ export function createBriefingServer(client: TeamleaderClient): FilteredServer {
   const registered: string[] = [];
   const skipped: string[] = [];
 
+  const permitted = (name: string): boolean => {
+    if (options.allow && !options.allow.has(name)) return false;
+    if (options.deny?.has(name)) return false;
+    return true;
+  };
+
   const wrap = (original: unknown) =>
     function (this: McpServer, name: string, ...rest: unknown[]) {
-      if (!BRIEFING_TOOLS.has(name)) {
+      if (!permitted(name)) {
         skipped.push(name);
         return NOT_REGISTERED;
       }
@@ -109,16 +157,23 @@ export function createBriefingServer(client: TeamleaderClient): FilteredServer {
     proto.registerTool = originalRegisterTool;
   }
 
-  // If upstream ever registers tools through some other path, the wrappers
-  // would never run and this endpoint would silently serve write tools. Fail
-  // at startup instead.
-  if (registered.length === 0 || skipped.length === 0) {
+  if (registered.length === 0 || (options.expectSkips && skipped.length === 0)) {
     throw new Error(
-      `Read-only tool filter did not take effect (registered ${registered.length}, ` +
-        `skipped ${skipped.length}). The briefing endpoint would expose write tools, ` +
-        `so refusing to start. Check how src/server.ts registers tools.`
+      `Tool filter did not take effect (registered ${registered.length}, ` +
+        `skipped ${skipped.length}). Tools that were meant to be excluded would be ` +
+        `served, so refusing to start. Check how src/server.ts registers tools.`
     );
   }
 
   return { server, registered, skipped };
+}
+
+/** The read-only server behind the unattended briefing endpoint. */
+export function createBriefingServer(client: TeamleaderClient): FilteredServer {
+  return createFilteredServer(client, { allow: BRIEFING_TOOLS, expectSkips: true });
+}
+
+/** The interactive server: everything upstream offers, minus its time tracking. */
+export function createWorkServer(client: TeamleaderClient): FilteredServer {
+  return createFilteredServer(client, { deny: UPSTREAM_TIME_TRACKING_TOOLS });
 }

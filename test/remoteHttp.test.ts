@@ -15,8 +15,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalizeResource, loadHttpConfig, type HttpConfig } from "../src/http/config.js";
 import { UserStore } from "../src/http/users.js";
-import { BRIEFING_TOOLS, createBriefingServer } from "../src/http/readOnly.js";
+import {
+  BRIEFING_TOOLS,
+  UPSTREAM_TIME_TRACKING_TOOLS,
+  createBriefingServer,
+  createWorkServer,
+} from "../src/http/readOnly.js";
 import { BRIEFING_TOOL_NAMES } from "../src/http/briefingTools.js";
+import {
+  TIME_TRACKING_READ_TOOLS,
+  TIME_TRACKING_WRITE_TOOLS,
+} from "../src/http/timeTrackingTools.js";
 import { hashPassword, verifyPassword } from "../src/http/password.js";
 import { OAuthStore } from "../src/http/store.js";
 import { LocalOAuthProvider } from "../src/http/provider.js";
@@ -326,6 +335,37 @@ describe("read-only briefing server", () => {
     expect(skipped).toContain("teamleader_create_task");
     expect(skipped).toContain("teamleader_create_company");
     expect(skipped).toContain("teamleader_update_deal");
+  });
+});
+
+describe("upstream time tracking suppression", () => {
+  const auth = new TeamleaderAuth({ clientId: "", clientSecret: "", refreshToken: "" });
+  const client = new TeamleaderClient(auth);
+
+  it("suppresses upstream's time tracking tools on the interactive server", () => {
+    // With TEAMLEADER_TOOLS unset every upstream group is active, which is the
+    // case that a configuration-based check would miss: upstream would register
+    // the same tool names as src/http/timeTrackingTools.ts and tools/list would
+    // fail with "already registered".
+    const { registered, skipped } = createWorkServer(client);
+    for (const name of UPSTREAM_TIME_TRACKING_TOOLS) {
+      expect(skipped, name).toContain(name);
+      expect(registered, name).not.toContain(name);
+    }
+  });
+
+  it("keeps every other upstream tool", () => {
+    const { registered } = createWorkServer(client);
+    expect(registered).toContain("teamleader_create_event");
+    expect(registered).toContain("teamleader_list_deals");
+    expect(registered.length).toBeGreaterThan(50);
+  });
+
+  it("the briefing server never had them either", () => {
+    const { registered } = createBriefingServer(client);
+    for (const name of UPSTREAM_TIME_TRACKING_TOOLS) {
+      expect(registered, name).not.toContain(name);
+    }
   });
 });
 
@@ -739,7 +779,14 @@ describe("HTTP surface", () => {
     // The purpose-built briefing tools are registered after the filter runs;
     // they are read-only by construction (only *.list and *.info).
     expect(names).toContain("teamleader_briefing_agenda");
-    const allowed = new Set<string>([...BRIEFING_TOOLS, ...BRIEFING_TOOL_NAMES]);
+    // Time tracking reads are safe unattended; the writes must not be here.
+    expect(names).toContain("teamleader_timer_current");
+    for (const w of TIME_TRACKING_WRITE_TOOLS) expect(names).not.toContain(w);
+    const allowed = new Set<string>([
+      ...BRIEFING_TOOLS,
+      ...BRIEFING_TOOL_NAMES,
+      ...TIME_TRACKING_READ_TOOLS,
+    ]);
     for (const name of names) expect(allowed.has(name), name).toBe(true);
   });
 
@@ -754,6 +801,11 @@ describe("HTTP surface", () => {
     expect(names).toContain("teamleader_create_event");
     // The briefing tools are useful interactively too.
     expect(names).toContain("teamleader_briefing_agenda");
+    // Time tracking, read and write, per the official API surface.
+    for (const t of [...TIME_TRACKING_READ_TOOLS, ...TIME_TRACKING_WRITE_TOOLS]) {
+      expect(names, t).toContain(t);
+    }
+    expect(names).toContain("teamleader_timer_stop");
     expect(names.length).toBeGreaterThan(BRIEFING_TOOLS.size);
   });
 
