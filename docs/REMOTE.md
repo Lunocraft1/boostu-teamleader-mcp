@@ -125,13 +125,32 @@ development instance at the production credentials.
 
 ### 1. DNS
 
-Add an `A` record for the subdomain pointing at the server, and confirm it from
+Add an `A` record for the hostname pointing at the server, and confirm it from
 outside your network — Claude rejects any hostname that resolves to a private
 address, and connectors are IPv4-only:
 
 ```bash
-dig +short mcp.von-falken.de A     # must return the public IPv4
+dig +short YOUR.DOMAIN.EXAMPLE A   # must return the public IPv4
 ```
+
+**If you cannot edit the zone of your own domain**, a free dynamic-DNS hostname
+works, but only from a provider listed on the
+[Public Suffix List](https://publicsuffix.org/list/). Let's Encrypt applies its
+rate limits per registered domain, so a provider that is *not* on the list
+shares one quota across all of its users worldwide and issuance almost always
+fails. Verified at the time of writing:
+
+| Works | Does not work |
+|---|---|
+| `duckdns.org`, `dedyn.io`, `dynv6.net`, `nsupdate.info` | `nip.io`, `sslip.io`, `afraid.org`, `traefik.me` |
+
+With a dynamic-DNS provider, set the address by hand to the server's IP. These
+services default to the IP of whoever is signed in, which is the browser's
+connection, not the server.
+
+Changing the hostname later means changing `PUBLIC_BASE_URL`, which changes the
+token audience: every connected client has to be removed and re-added in Claude
+and authorized again. Nothing is lost, but it is not transparent.
 
 ### 2. Teamleader integration
 
