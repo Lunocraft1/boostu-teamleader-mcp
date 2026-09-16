@@ -173,4 +173,37 @@ describe("isAutomated", () => {
   it("does not mistake a person whose name contains 'list'", () => {
     expect(isAutomated({ from: "christa.liston@example.com" }).automated).toBe(false);
   });
+
+  it("flags plural notification addresses", () => {
+    // Real sender from the live mailbox. A word-boundary pattern for the
+    // singular "notification" silently missed every one of these.
+    const r = isAutomated({ from: "notifications@teamleader.eu" });
+    expect(r.automated).toBe(true);
+    expect(r.reason).toMatch(/Benachrichtigung/);
+  });
+
+  it("flags an invoicing automat with a dotted local part", () => {
+    const r = isAutomated({ from: "invoicing.focus@teamleader.eu" });
+    expect(r.automated).toBe(true);
+    expect(r.reason).toMatch(/Rechnung/);
+  });
+
+  it("flags notify- and newsletter-style local parts", () => {
+    expect(isAutomated({ from: "notify-me@service.example" }).automated).toBe(true);
+    expect(isAutomated({ from: "newsletters@shop.example" }).automated).toBe(true);
+    expect(isAutomated({ from: "mailing@shop.example" }).automated).toBe(true);
+  });
+
+  it("leaves real people and shared human mailboxes alone", () => {
+    // These are people or mailboxes a human reads; a draft reply is wanted.
+    for (const from of [
+      "patrick.hofmann1@carrier.com",
+      "service@von-falken.de",
+      "info@lieferant.example",
+      "buchhaltung@kunde.example",
+      "notarius.mueller@kanzlei.example",
+    ]) {
+      expect(isAutomated({ from }).automated, from).toBe(false);
+    }
+  });
 });

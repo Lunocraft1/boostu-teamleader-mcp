@@ -171,14 +171,30 @@ export function isAutomated(fields: {
   if (["bulk", "junk", "list"].includes((fields.precedence ?? "").toLowerCase())) {
     return { automated: true, reason: "Precedence: " + fields.precedence };
   }
-  if (/(^|[.\-_+])(no[-_.]?reply|do[-_.]?not[-_.]?reply|noreply)@|@no[-_.]?reply\./.test(from)) {
+  // Matched against the local part rather than the whole address: a person
+  // called "Liston" must not look like a mailing list, and "notifications@"
+  // must match even though it is plural — an earlier word-boundary pattern for
+  // the singular silently missed every Teamleader notification.
+  const local = from.split("@")[0] ?? "";
+  const AUTOMATED_LOCAL: [RegExp, string][] = [
+    [/^no[-_.]?reply/, "No-Reply-Absender"],
+    [/^do[-_.]?not[-_.]?reply/, "No-Reply-Absender"],
+    [/^mailer[-_.]?daemon/, "Systemadresse"],
+    [/^postmaster/, "Systemadresse"],
+    [/^bounces?[-_.]?/, "Systemadresse"],
+    [/^notifications?([-_.]|$)/, "Benachrichtigungsadresse"],
+    [/^notify([-_.]|$)/, "Benachrichtigungsadresse"],
+    [/^newsletters?([-_.]|$)/, "Newsletter-Absender"],
+    [/^mailings?([-_.]|$)/, "Newsletter-Absender"],
+    [/^invoicing([-_.]|$)/, "Rechnungsautomatik"],
+    [/^billing([-_.]|$)/, "Rechnungsautomatik"],
+    [/^automat/, "Automatikadresse"],
+  ];
+  for (const [pattern, reason] of AUTOMATED_LOCAL) {
+    if (pattern.test(local)) return { automated: true, reason };
+  }
+  if (/@no[-_.]?reply\./.test(from)) {
     return { automated: true, reason: "No-Reply-Absender" };
-  }
-  if (/(^|[.\-_+])(mailer[-_.]?daemon|postmaster|bounce)/.test(from)) {
-    return { automated: true, reason: "Systemadresse" };
-  }
-  if (/\b(newsletter|mailing|notification|benachrichtigung)\b/.test(from)) {
-    return { automated: true, reason: "Absender deutet auf Automatik" };
   }
   if (/^(undelivered mail|mail delivery|zustellung fehlgeschlagen|automatische antwort|automatic reply|out of office|abwesenheit)/.test(subject)) {
     return { automated: true, reason: "Betreff deutet auf Automatik" };
