@@ -11,7 +11,6 @@ import { loadHttpConfig } from "./http/config.js";
 import { createApp } from "./http/app.js";
 import { OAuthStore } from "./http/store.js";
 import { UserStore } from "./http/users.js";
-import { loadMailConfig } from "./http/mail/imap.js";
 import { BRIEFING_TOOLS } from "./http/readOnly.js";
 import { SerializedTeamleaderAuth, lockTokenStore } from "./http/teamleader.js";
 import { TeamleaderClient } from "./api/client.js";
@@ -49,14 +48,7 @@ async function main(): Promise<void> {
 
   const store = new OAuthStore(config.dbPath, config.allowedRedirectUris);
   const users = UserStore.load();
-  const mail = loadMailConfig();
-  if (!mail) {
-    console.warn(
-      "[teamleader-mcp] No mailbox configured (MAIL_IMAP_*). The mail tools stay off; " +
-        "mail_health still reports why."
-    );
-  }
-  const app = createApp({ config, store, users, client, mail });
+  const app = createApp({ config, store, users, client });
 
   const server = app.listen(config.port, config.host, () => {
     console.log(`[teamleader-mcp] listening on http://${config.host}:${config.port}`);
@@ -71,9 +63,6 @@ async function main(): Promise<void> {
     }
     console.log(`[teamleader-mcp] tool groups       ${process.env.TEAMLEADER_TOOLS ?? "(all)"}`);
     console.log(`[teamleader-mcp] accounts          ${users.count()} (${users.usernames().join(", ")})`);
-    console.log(
-      `[teamleader-mcp] mailbox           ${mail ? `${mail.user} via ${mail.host}:${mail.port}` : "(not configured)"}`
-    );
     console.log(`[teamleader-mcp] token store       ${process.env.TEAMLEADER_TOKEN_STORE ?? "(none)"}`);
     console.log(`[teamleader-mcp] oauth store       ${config.dbPath}`);
     console.log(`[teamleader-mcp] registered clients ${store.countClients()}`);

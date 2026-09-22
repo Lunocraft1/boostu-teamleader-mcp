@@ -27,7 +27,6 @@ import {
   TIME_TRACKING_WRITE_TOOLS,
   registerTimeTrackingTools,
 } from "../src/http/timeTrackingTools.js";
-import { MAIL_READ_TOOLS, MAIL_WRITE_TOOLS } from "../src/http/mail/tools.js";
 import { hashPassword, verifyPassword } from "../src/http/password.js";
 import { OAuthStore } from "../src/http/store.js";
 import { LocalOAuthProvider } from "../src/http/provider.js";
@@ -835,9 +834,6 @@ describe("HTTP surface", () => {
     expect(names).toContain("teamleader_briefing_agenda");
     // Time tracking reads are safe unattended; the writes must not be here.
     expect(names).toContain("teamleader_timer_current");
-    // mail_health is registered even without mailbox credentials, so an empty
-    // mail section can always be told apart from an unreachable mailbox.
-    expect(names).toContain("mail_health");
     // Nothing that deletes, moves or sends, whatever else is registered.
     for (const name of names) {
       expect(name, name).not.toMatch(/_(send|delete|move|remove|close|reopen)(_|$)/);
@@ -847,10 +843,6 @@ describe("HTTP surface", () => {
       ...BRIEFING_TOOLS,
       ...BRIEFING_TOOL_NAMES,
       ...TIME_TRACKING_READ_TOOLS,
-      ...MAIL_READ_TOOLS,
-      // The draft tool is the single deliberate exception to this endpoint
-      // being read-only; see docs/REMOTE.md.
-      ...MAIL_WRITE_TOOLS,
     ]);
     for (const name of names) expect(allowed.has(name), name).toBe(true);
   });
